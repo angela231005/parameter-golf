@@ -1712,7 +1712,8 @@ def main() -> None:
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
         diff_attn=args.diff_attn,
-    ).to(device).bfloat16() (like CastedLinear weights), cast to BF16 in forward
+    ).to(device).bfloat16()
+    # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
     base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
