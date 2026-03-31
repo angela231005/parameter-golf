@@ -45,6 +45,10 @@ SEED          = 42          # change per run: 314, 42, 999
 NPROC         = 1           # 1 for Colab/single H100, 8 for full node
 TARGET_MB     = 15.9
 
+# --- Paths (set to your existing dataset/tokenizer locations) ---
+DATA_PATH      = "./data/datasets/fineweb10B_sp1024"   # folder with fineweb_train_*.bin & fineweb_val_*.bin
+TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
+
 # --- Fixed SOTA settings ---
 BIGRAM_VOCAB_SIZE = 3072
 BIGRAM_DIM        = 112
@@ -53,6 +57,8 @@ ITERATIONS        = 6927    # step-based stopping (equivalent to 600s on 8×H100
 
 env = " ".join([
     f"SEED={SEED}",
+    f"DATA_PATH={DATA_PATH}",
+    f"TOKENIZER_PATH={TOKENIZER_PATH}",
     f"BIGRAM_VOCAB_SIZE={BIGRAM_VOCAB_SIZE}",
     f"BIGRAM_DIM={BIGRAM_DIM}",
     f"WARMDOWN_ITERS={WARMDOWN_ITERS}",
