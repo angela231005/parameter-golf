@@ -6,6 +6,8 @@
 # ## 1. Clone repo
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2026-03-31T13:06:21.086153Z","iopub.execute_input":"2026-03-31T13:06:21.086529Z","iopub.status.idle":"2026-03-31T13:06:22.463952Z","shell.execute_reply.started":"2026-03-31T13:06:21.086495Z","shell.execute_reply":"2026-03-31T13:06:22.462941Z"}}
+import torch
+import glob
 import os
 
 REPO_URL = "https://github.com/angela231005/parameter-golf"
@@ -23,21 +25,9 @@ print("cwd:", os.getcwd())
 # ## 2. Install dependencies
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2026-03-31T13:06:22.465853Z","iopub.execute_input":"2026-03-31T13:06:22.466603Z","iopub.status.idle":"2026-03-31T13:07:05.632461Z","shell.execute_reply.started":"2026-03-31T13:06:22.466566Z","shell.execute_reply":"2026-03-31T13:07:05.631110Z"}}
-# Flash Attention 3 (Hopper / H100 required)
-os.system("pip install -q flash_attn_3 --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291")
+# Install dependencies (flash_attn_3 removed — using PyTorch built-in SDPA)
 os.system("pip install -q sentencepiece zstandard")
-
-# Fix LD_LIBRARY_PATH so flash_attn_3 can find libcudart.so.12.
-# PyTorch bundles its own CUDA libs — exposing that dir is the most reliable approach.
-import glob, torch
-_lib_dirs = [os.path.join(os.path.dirname(torch.__file__), "lib")]
-_lib_dirs += sorted(glob.glob("/usr/local/cuda*/lib64"), reverse=True)
-_ld = os.environ.get("LD_LIBRARY_PATH", "")
-os.environ["LD_LIBRARY_PATH"] = ":".join(_lib_dirs) + (":" + _ld if _ld else "")
-print("LD_LIBRARY_PATH:", os.environ["LD_LIBRARY_PATH"])
-
-# Verify
-os.system('python3 -c "from flash_attn_interface import flash_attn_func; import sentencepiece, zstandard; print(\'deps OK\')"')
+os.system('python3 -c "import sentencepiece, zstandard; print(\'deps OK\')"')
 
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # ## 3. Download & prepare data
@@ -66,7 +56,6 @@ WARMDOWN_ITERS = 4000
 ITERATIONS = 6927    # step-based stopping (equivalent to 600s on 8×H100)
 
 env = " ".join([
-    f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '')}",
     f"SEED={SEED}",
     f"BIGRAM_VOCAB_SIZE={BIGRAM_VOCAB_SIZE}",
     f"BIGRAM_DIM={BIGRAM_DIM}",
