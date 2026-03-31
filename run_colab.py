@@ -27,13 +27,14 @@ print("cwd:", os.getcwd())
 os.system("pip install -q flash_attn_3 --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291")
 os.system("pip install -q sentencepiece zstandard")
 
-# Fix LD_LIBRARY_PATH so libcudart.so.12 is visible (needed on Kaggle/Colab)
-import glob
-_cuda_lib_dirs = sorted(glob.glob("/usr/local/cuda*/lib64"), reverse=True)
-if _cuda_lib_dirs:
-    _ld = os.environ.get("LD_LIBRARY_PATH", "")
-    os.environ["LD_LIBRARY_PATH"] = ":".join(_cuda_lib_dirs) + (":" + _ld if _ld else "")
-    print("LD_LIBRARY_PATH:", os.environ["LD_LIBRARY_PATH"])
+# Fix LD_LIBRARY_PATH so flash_attn_3 can find libcudart.so.12.
+# PyTorch bundles its own CUDA libs — exposing that dir is the most reliable approach.
+import glob, torch
+_lib_dirs = [os.path.join(os.path.dirname(torch.__file__), "lib")]
+_lib_dirs += sorted(glob.glob("/usr/local/cuda*/lib64"), reverse=True)
+_ld = os.environ.get("LD_LIBRARY_PATH", "")
+os.environ["LD_LIBRARY_PATH"] = ":".join(_lib_dirs) + (":" + _ld if _ld else "")
+print("LD_LIBRARY_PATH:", os.environ["LD_LIBRARY_PATH"])
 
 # Verify
 os.system('python3 -c "from flash_attn_interface import flash_attn_func; import sentencepiece, zstandard; print(\'deps OK\')"')
