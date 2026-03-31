@@ -1582,7 +1582,7 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_math_sdp(True)  # needed for torch.compile tracing with fake tensors
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
