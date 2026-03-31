@@ -57,6 +57,8 @@ ITERATIONS = 6927    # step-based stopping (equivalent to 600s on 8×H100)
 
 env = " ".join([
     f"SEED={SEED}",
+    f"DATA_PATH={DATA_PATH}",
+    f"TOKENIZER_PATH={TOKENIZER_PATH}",
     f"BIGRAM_VOCAB_SIZE={BIGRAM_VOCAB_SIZE}",
     f"BIGRAM_DIM={BIGRAM_DIM}",
     f"WARMDOWN_ITERS={WARMDOWN_ITERS}",
