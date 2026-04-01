@@ -1,10 +1,11 @@
 from __future__ import annotations
+import os
+os.environ.setdefault('TORCHINDUCTOR_COMBO_KERNELS', '0')  # must be before torch import
 import copy
 import glob
 import io
 import lzma
 import math
-import os
 import random
 import subprocess
 import sys
@@ -41,8 +42,6 @@ def _decompress(data: bytes) -> bytes:
         return brotli.decompress(data)
 import sentencepiece as spm
 import torch
-import torch._inductor.config as _inductor_cfg
-_inductor_cfg.combo_kernels = False          # avoid FusedMixOrderReductions assertion in backward
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn

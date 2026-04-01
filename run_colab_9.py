@@ -61,6 +61,8 @@ env = " ".join([
     f"RECUR_LAYERS=4,5",
     f"RECUR_START_STEP=3000",
     f"BIGRAM_DIM=112",
+    # Inductor workaround for FusedMixOrderReductions assertion
+    f"TORCHINDUCTOR_COMBO_KERNELS=0",
 ])
 
 cmd = f"{env} torchrun --standalone --nproc_per_node={NPROC} train_gpt_sota_9.py"
