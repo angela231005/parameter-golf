@@ -1141,7 +1141,8 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True,
+                                     options={"combo_kernels": False})
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1769,7 +1770,8 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True,
+                                    options={"combo_kernels": False})
     model = compiled_model
 
     # Optimizer split:
@@ -1967,7 +1969,8 @@ def main() -> None:
         if not base_model.recur_active and args.recur_layers and step >= args.recur_start_step:
             base_model.recur_active = True
             # Need to recompile since forward graph changed
-            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True,
+                                            options={"combo_kernels": False})
             model = compiled_model
             log0(f"recurrence:activated step:{step} layers:{args.recur_layers}")
         zero_grad_all()
@@ -2237,7 +2240,8 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True,
+                                   options={"combo_kernels": False})
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
