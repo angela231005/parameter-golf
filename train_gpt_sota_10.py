@@ -104,7 +104,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 4))
     muon_momentum_warmup_start = float(
         os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(
@@ -884,9 +884,16 @@ class MLP(nn.Module):
         super().__init__()
         # No CastedLinear -- weights come from banks
 
-    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
-        return F.linear(x.square(), down_w.to(x.dtype))
+    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor, slope: Tensor | None = None) -> Tensor:
+        h = F.linear(x, up_w.to(x.dtype))
+        if slope is not None:
+            # Branchless leaky relu: max(h, slope*h) using relu decomposition
+            s = slope.to(dtype=h.dtype)
+            h_relu = F.relu(h)
+            h = h_relu + s * (h - h_relu)
+        else:
+            h = F.leaky_relu(h, negative_slope=0.5)
+        return F.linear(h.square(), down_w.to(x.dtype))
 
 
 class Block(nn.Module):
@@ -916,6 +923,9 @@ class Block(nn.Module):
             (torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / \
             math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        # ASQU v3: per-layer learned MLP slope, init via linear schedule (L0≈-0.014, L10≈0.468)
+        asqu_slope = -0.014 + 0.0482 * layer_idx
+        self.mlp_slope = nn.Parameter(torch.tensor(asqu_slope, dtype=torch.float32))
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
             nn.init.zeros_(self.dtg_gate.weight)
@@ -931,7 +941,7 @@ class Block(nn.Module):
         x_out = x_in + \
             self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(
-            self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+            self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w, self.mlp_slope)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -953,7 +963,7 @@ class Block(nn.Module):
         # MLP reads lane1
         mlp_in = mix[0][None, None, :] * x_lane1 + mix[1][None, None, :] * x0
         mlp_out = self.mlp(self.mlp_norm(mlp_in) *
-                           self.ln_scale_factor, up_w, down_w)
+                           self.ln_scale_factor, up_w, down_w, self.mlp_slope)
         scaled_mlp = self.mlp_scale.to(dtype=mlp_out.dtype)[
             None, None, :] * mlp_out
         # Cross-lane writes: ppl[to_lane, from_sublayer, D], prl[lane, D]
