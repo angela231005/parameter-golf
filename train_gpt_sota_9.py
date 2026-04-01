@@ -783,17 +783,6 @@ class MLP(nn.Module):
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
-@torch.compiler.disable
-def _mix_parallel_lanes(x_lane0: Tensor, x_lane1: Tensor,
-                        scaled_attn: Tensor, scaled_mlp: Tensor,
-                        ppl: Tensor, prl: Tensor) -> tuple[Tensor, Tensor]:
-    """Cross-lane writes (runs in eager to avoid inductor FusedMixOrderReductions bug)."""
-    ppl_d = ppl.to(dtype=x_lane0.dtype)
-    prl_d = prl.to(dtype=x_lane0.dtype)
-    new_lane0 = prl_d[0] * x_lane0 + ppl_d[0, 0] * scaled_attn + ppl_d[0, 1] * scaled_mlp
-    new_lane1 = prl_d[1] * x_lane1 + ppl_d[1, 0] * scaled_attn + ppl_d[1, 1] * scaled_mlp
-    return new_lane0, new_lane1
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -852,9 +841,11 @@ class Block(nn.Module):
         mlp_in = mix[0][None, None, :] * x_lane1 + mix[1][None, None, :] * x0
         mlp_out = self.mlp(self.mlp_norm(mlp_in) * self.ln_scale_factor, up_w, down_w)
         scaled_mlp = self.mlp_scale.to(dtype=mlp_out.dtype)[None, None, :] * mlp_out
-        # Cross-lane writes: ppl[to_lane, from_sublayer(attn/mlp)], prl[lane]
-        new_lane0, new_lane1 = _mix_parallel_lanes(
-            x_lane0, x_lane1, scaled_attn, scaled_mlp, ppl, prl)
+        # Cross-lane writes: ppl[to_lane, from_sublayer, D], prl[lane, D]
+        ppl_d = ppl.to(dtype=x_lane0.dtype)
+        prl_d = prl.to(dtype=x_lane0.dtype)
+        new_lane0 = prl_d[0][None, None, :] * x_lane0 + ppl_d[0, 0][None, None, :] * scaled_attn + ppl_d[0, 1][None, None, :] * scaled_mlp
+        new_lane1 = prl_d[1][None, None, :] * x_lane1 + ppl_d[1, 0][None, None, :] * scaled_attn + ppl_d[1, 1][None, None, :] * scaled_mlp
         return new_lane0, new_lane1, raw_v
 
 class GPT(nn.Module):
@@ -956,13 +947,13 @@ class GPT(nn.Module):
         self.value_embeds = nn.ModuleList()  # keep empty for compat
         # Parallel residual parameters (used for layers >= parallel_start_layer)
         if parallel_residual:
-            # Cross-lane write coefficients: [num_layers, 2(to_lane), 2(from_sublayer:attn/mlp)]
+            # Cross-lane write coefficients: [num_layers, 2(to_lane), 2(from_sublayer:attn/mlp), D]
             self.parallel_post_lambdas = nn.Parameter(
-                torch.ones(num_layers, 2, 2, dtype=torch.float32)
+                torch.ones(num_layers, 2, 2, model_dim, dtype=torch.float32)
             )
-            # Per-lane residual scaling: [num_layers, 2(lanes)]
+            # Per-lane residual scaling: [num_layers, 2(lanes), D]
             self.parallel_resid_lambdas = nn.Parameter(
-                torch.full((num_layers, 2), math.sqrt(1.1), dtype=torch.float32)
+                torch.full((num_layers, 2, model_dim), math.sqrt(1.1), dtype=torch.float32)
             )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -1150,7 +1141,7 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1778,7 +1769,7 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
 
     # Optimizer split:
@@ -1976,7 +1967,7 @@ def main() -> None:
         if not base_model.recur_active and args.recur_layers and step >= args.recur_start_step:
             base_model.recur_active = True
             # Need to recompile since forward graph changed
-            compiled_model = torch.compile(base_model, dynamic=False)
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
             model = compiled_model
             log0(f"recurrence:activated step:{step} layers:{args.recur_layers}")
         zero_grad_all()
@@ -2246,7 +2237,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False)
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
