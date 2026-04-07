@@ -70,7 +70,8 @@ env = " ".join([
     # --- Depth Recurrence (sota_11+: 4 layers, starts earlier) ---
     f"RECUR_LAYERS=2,3,4,5",
     f"RECUR_START_STEP=1500",
-    f"RECUR_PASSES=2",       # NEW: 2× deeper recurrence at eval
+    f"RECUR_PASSES=1",       # 1 during training (recur_passes=2 backward OOMs Triton)
+    f"EVAL_RECUR_PASSES=2",  # 2× deeper recurrence for TTT scoring (inference_mode, no backward)
     # --- MTP auxiliary ---
     f"MTP_NUM_HEADS=2",
     f"MTP_LOSS_WEIGHT=0.1",

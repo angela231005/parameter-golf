@@ -162,6 +162,8 @@ class Hyperparameters:
     recur_start_step = int(os.environ.get(
         "RECUR_START_STEP", 1500))  # earlier activation for more recurrence-mode steps
     recur_passes = int(os.environ.get("RECUR_PASSES", 1))  # repeat recur layers N times per forward pass
+    # eval_recur_passes: deeper recurrence ONLY during inference_mode scoring (no backward risk)
+    eval_recur_passes = int(os.environ.get("EVAL_RECUR_PASSES", recur_passes))
     repeat_untie_mlp = os.environ.get(
         "REPEAT_UNTIE_MLP", "full")  # 'full'|'down'|'none'
     # --- Legal Score-First TTT ---
@@ -1943,6 +1945,7 @@ def run_legal_ttt(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    eval_recur_passes: int = 1,
 ) -> tuple[float, float]:
     """PR #461 Legal Score-First TTT protocol.
 
@@ -1989,6 +1992,9 @@ def run_legal_ttt(
             device=device, dtype=torch.int64)
 
         # === (1) SCORE: inference_mode guarantees zero weight mutation ===
+        # Use eval_recur_passes for deeper model at score time (inference_mode = forward only, no OOM)
+        orig_mod = getattr(model, '_orig_mod', model)
+        orig_mod.recur_passes = eval_recur_passes
         model.eval()
         with torch.inference_mode():
             for bi in range(0, nseq, batch_seqs):
@@ -2009,6 +2015,8 @@ def run_legal_ttt(
                 byte_count += tb.sum()
 
         # === (2) TRAIN: adapt on already-scored chunk. Skip last chunk. ===
+        # Revert to recur_passes=1 for backward — recur_passes=eval_recur_passes backward OOMs
+        orig_mod.recur_passes = 1
         if ci < len(my_starts) - 1:
             model.train()
             for _epoch in range(args.ttt_epochs):
@@ -2753,6 +2761,7 @@ def main() -> None:
         ttt_val_loss, ttt_val_bpb = run_legal_ttt(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            eval_recur_passes=args.eval_recur_passes,
         )
         torch.cuda.synchronize()
         ttt_elapsed = 1000.0 * (time.perf_counter() - t_ttt)
