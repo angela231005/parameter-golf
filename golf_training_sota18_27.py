@@ -74,10 +74,11 @@ TOKENIZER_PATH = "/kaggle/input/datasets/haphmph/parameter-golf/data/tokenizers/
 
 ITERATIONS = 6927
 
-# Batch scaling: 786432 is baseline for 8 GPUs; scale down for fewer GPUs
-# and compensate with gradient accumulation to keep effective batch size equal.
-_batch   = max(65536, 786432 // 8 * NPROC)
-_gacc    = max(1, 8 // NPROC)
+# Step milestones: scale proportionally with ITERATIONS
+# so QAT/recurrence/warmdown ratios stay correct regardless of total steps.
+_qat_step   = int(ITERATIONS * 0.29)   # ~29% → LR starts warmdown → best QAT window
+_recur_step = int(ITERATIONS * 0.20)   # ~20% → enough pretraining before recur cost
+_warmdown   = int(ITERATIONS * 0.57)   # ~57% matches sota_17 (4000/6927)
 
 # --- Per-idea extra env vars ---
 IDEA_EXTRA = {
@@ -85,6 +86,8 @@ IDEA_EXTRA = {
         "HADAMARD_ROTATION=1",
         "AWQ_ALPHA=0.5",
         "GPTQ_AR_SEQS=64",
+        # Scale QAT to begin during warmdown (not at LR peak)
+        f"QAT_START_STEP={_qat_step}",
     ],
     19: [  # 4-gram + 5-gram hash
         "BIGRAM_VOCAB_SIZE=3072",
@@ -138,10 +141,11 @@ env = " ".join([
     f"DATA_PATH={DATA_PATH}",
     f"TOKENIZER_PATH={TOKENIZER_PATH}",
     f"ITERATIONS={ITERATIONS}",
+    f"WARMDOWN_ITERS={_warmdown}",
+    f"RECUR_START_STEP={_recur_step}",
     f"MAX_WALLCLOCK_SECONDS=0",
     f"TARGET_MB={TARGET_MB}",
-    f"TRAIN_BATCH_TOKENS={_batch}",
-    f"GRAD_ACCUM_STEPS={_gacc}",
+    f"TRAIN_BATCH_TOKENS=786432",
     # --- Architecture (same as sota_17 baseline) ---
     f"NUM_LAYERS=11",
     f"MODEL_DIM=512",
@@ -170,7 +174,7 @@ env = " ".join([
 
 SCRIPT = f"train_gpt_sota_{IDEA_NUM}.py"
 cmd = f"{env} torchrun --standalone --nproc_per_node={NPROC} {SCRIPT}"
-print(f"IDEA={IDEA_NUM}  NPROC={NPROC}  batch={_batch}  grad_accum={_gacc}")
+print(f"IDEA={IDEA_NUM}  NPROC={NPROC}")
 print("Command:")
 print(cmd)
 
