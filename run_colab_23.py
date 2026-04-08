@@ -12,7 +12,7 @@
 #
 # **Inherited from sota_22 (unchanged):**
 # - Mousse EMA optimizer (beta=0.95, PR #1440)
-# - TTT SGD lr=0.002 (AdamW lr=0.01 DESTROYED sota_22: 1.1047→1.7984; never again)
+# - TTT AdamW lr=0.0003 (Raki dùng 0.01 nhưng model mình ít steps hơn → 10× nhỏ hơn để an toàn)
 # - RECUR_COUNT=1 — Raki v6 actual code: 1 extra pass (log said 2 but code is 1); count=2 was 54% overhead
 # - LAWA (k=15, freq=50)
 # - GPTQ 11-candidate percentile grid + 128 AR calibration seqs
@@ -91,11 +91,12 @@ env = " ".join([
     # --- GPTQ calibration ---
     f"GPTQ_AR_SEQS=128",
     # --- Legal Score-First TTT ---
-    # NOTE: AdamW lr=0.01 DESTROYED SOTA22 (val_bpb 1.1047 → 1.7984). NEVER again.
-    # Reverted to SGD lr=0.002 (sota_19 style — safe and slightly helpful).
+    # sota_22: AdamW lr=0.01 → catastrophic (1.1047→1.7984); Raki v6 uses same lr=0.01 and OK
+    #   → diff: Raki 8×H100 20k steps, very stable model; ours 1×H100 6927 steps = more sensitive
+    # Try AdamW lr=0.0003 (10× smaller than Raki) — adaptive per-param should beat SGD if LR is safe
     f"TTT_ENABLED=1",
-    f"TTT_LR=0.002",                  # SGD: safe (AdamW lr=0.01 = catastrophic)
-    f"TTT_OPTIMIZER=sgd",             # SGD, not AdamW
+    f"TTT_LR=0.0003",                 # AdamW: 10× smaller than Raki (lr=0.01) for safety
+    f"TTT_OPTIMIZER=adamw",           # adaptive per-param > SGD when gradient magnitudes vary
     f"TTT_EPOCHS=3",
     f"TTT_CHUNK_SIZE=32768",
     f"TTT_FREEZE_BLOCKS=0",
