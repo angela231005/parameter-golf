@@ -91,9 +91,11 @@ env = " ".join([
     # --- GPTQ calibration ---
     f"GPTQ_AR_SEQS=128",
     # --- Legal Score-First TTT ---
+    # NOTE: AdamW lr=0.01 DESTROYED SOTA22 (val_bpb 1.1047 → 1.7984). NEVER again.
+    # Reverted to SGD lr=0.002 (sota_19 style — safe and slightly helpful).
     f"TTT_ENABLED=1",
-    f"TTT_LR=0.01",                   # AdamW uses higher LR (PR #1440)
-    f"TTT_OPTIMIZER=adamw",           # AdamW TTT (PR #1440)
+    f"TTT_LR=0.002",                  # SGD: safe (AdamW lr=0.01 = catastrophic)
+    f"TTT_OPTIMIZER=sgd",             # SGD, not AdamW
     f"TTT_EPOCHS=3",
     f"TTT_CHUNK_SIZE=32768",
     f"TTT_FREEZE_BLOCKS=0",
