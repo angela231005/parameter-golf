@@ -956,8 +956,8 @@ class Rotary(nn.Module):
                 inv_freq = self.inv_freq.to(device)
             t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
             freqs = torch.outer(t, inv_freq)
-            self._cos_cached = freqs.cos()[None, :, None, :]
-            self._sin_cached = freqs.sin()[None, :, None, :]
+            self._cos_cached = freqs.cos()[None, :, None, :].detach()
+            self._sin_cached = freqs.sin()[None, :, None, :].detach()
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
@@ -2485,6 +2485,7 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
+    torch._dynamo.config.cache_size_limit = 64  # curriculum + recur + QAT phases cause >8 recompiles
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
 
@@ -2661,16 +2662,19 @@ def main() -> None:
         if _pw_lens:
             log0(f"seq_curriculum: pre-warming compiler for seq_lens {_pw_lens}...")
             base_model.train()
-            with torch.no_grad():
-                for _plen in _pw_lens:
-                    _nseq = max(1, args.train_batch_tokens // (world_size * grad_accum_steps * _plen))
-                    _px = torch.zeros((_nseq, _plen), dtype=torch.long, device=device)
-                    _py = torch.zeros((_nseq, _plen), dtype=torch.long, device=device)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        _out = model(_px, _py)
-                    del _out, _px, _py
-                    torch.cuda.synchronize()
-                    log0(f"seq_curriculum: compiled seq_len={_plen}")
+            # Run pre-warm WITHOUT no_grad so torch.compile sees the same grad+autocast
+            # context as actual training steps — making the compiled graphs reusable and
+            # not consuming extra slots in the recompile budget.
+            for _plen in _pw_lens:
+                _nseq = max(1, args.train_batch_tokens // (world_size * grad_accum_steps * _plen))
+                _px = torch.zeros((_nseq, _plen), dtype=torch.long, device=device)
+                _py = torch.zeros((_nseq, _plen), dtype=torch.long, device=device)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    _out = model(_px, _py)
+                del _out, _px, _py
+                torch.cuda.synchronize()
+                log0(f"seq_curriculum: compiled seq_len={_plen}")
+            zero_grad_all()  # discard any grad graph left over from the dummy forwards
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     from collections import deque
