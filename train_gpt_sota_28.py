@@ -2652,6 +2652,25 @@ def main() -> None:
         zero_grad_all()
         train_loader = DistributedTokenLoader(
             args.train_files, rank, world_size, device)
+    # Pre-warm compiler for all curriculum seq_lens to avoid ~70s recompile pauses mid-training.
+    # torch.compile(dynamic=False) locks to shapes seen during warmup (seq_len=2048); any
+    # new shape (512, 1024 from curriculum) triggers a full recompile at that step.
+    # Moving compilation here amortises the cost before training time starts.
+    if args.seq_curriculum_thresholds:
+        _pw_lens = [l for l in args.seq_curriculum_shorter_lens if l != args.train_seq_len]
+        if _pw_lens:
+            log0(f"seq_curriculum: pre-warming compiler for seq_lens {_pw_lens}...")
+            base_model.train()
+            with torch.no_grad():
+                for _plen in _pw_lens:
+                    _nseq = max(1, args.train_batch_tokens // (world_size * grad_accum_steps * _plen))
+                    _px = torch.zeros((_nseq, _plen), dtype=torch.long, device=device)
+                    _py = torch.zeros((_nseq, _plen), dtype=torch.long, device=device)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        _out = model(_px, _py)
+                    del _out, _px, _py
+                    torch.cuda.synchronize()
+                    log0(f"seq_curriculum: compiled seq_len={_plen}")
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     from collections import deque
