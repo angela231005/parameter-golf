@@ -13,7 +13,7 @@
 # **Inherited from sota_22 (unchanged):**
 # - Mousse EMA optimizer (beta=0.95, PR #1440)
 # - TTT AdamW lr=0.01 (PR #1440: beats SGD)
-# - RECUR_COUNT=2 — triple loop: 3 total passes through recur layers
+# - RECUR_COUNT=1 — Raki v6 actual code: 1 extra pass (log said 2 but code is 1); count=2 was 54% overhead
 # - LAWA (k=15, freq=50)
 # - GPTQ 11-candidate percentile grid + 128 AR calibration seqs
 # - Hash embedding 32768 entries
@@ -80,7 +80,7 @@ env = " ".join([
     f"VE_LAYERS=8,9,10",
     f"RECUR_LAYERS=4,5",              # Changed from 2,3,4,5 → 4,5 (PR #1420: optimal)
     f"RECUR_START_STEP=2424",         # Changed from 1500 → 2424 (0.35×6927, PR #1420 optimal)
-    f"RECUR_COUNT=2",                 # triple loop: 3 total passes (PR #1450/#1420)
+    f"RECUR_COUNT=1",                 # Raki v6 code: 1 extra pass only (hardcoded), not 2 — count=2 caused 54% overhead in sota_22
     # --- LAWA ---
     f"LAWA_ENABLED=1",
     f"LAWA_K=15",

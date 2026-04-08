@@ -144,7 +144,8 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.20))
-    qat_start_step = int(os.environ.get("QAT_START_STEP", 2000))
+    qat_start_step = int(os.environ.get("QAT_START_STEP", 0))  # legacy; prefer late_qat_steps
+    late_qat_steps = int(os.environ.get("LATE_QAT_STEPS", 200))  # Raki v6: QAT only last N steps
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
@@ -179,6 +180,8 @@ class Hyperparameters:
     ngram_beta = float(os.environ.get("NGRAM_BETA", 0.5))
     # Eval-time hash embedding: zero-init embed[(prev*2039+curr) % size] -> residual (PR #1460)
     hash_emb_size = int(os.environ.get("HASH_EMB_SIZE", 16384))
+    # Markov curriculum: upweight hard-to-predict tokens (Raki v6, power=0.10)
+    raki_power = float(os.environ.get("RAKI_POWER", 0.10))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -671,6 +674,54 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+class _GPUMarkov:
+    """Bigram surprise curriculum: upweight loss on tokens that bigram can't predict.
+    Adapted from Raki v6 (PR #1440). Reads first shard to build bigram table.
+    batch_weight() returns a scalar multiplier in [1.0, 1.0 + power].
+    """
+    def __init__(self, pattern: str, vocab_size: int, device: torch.device):
+        import glob as _g
+        files = sorted(_g.glob(pattern))
+        if not files:
+            self.log_probs = None
+            return
+        hdr_bytes = 256 * np.dtype("<i4").itemsize
+        hdr = np.fromfile(files[0], dtype="<i4", count=256)
+        ntok = min(int(hdr[2]), 2_000_000)
+        tok = np.fromfile(files[0], dtype="<u2", count=ntok, offset=hdr_bytes).astype(np.int32)
+        counts = np.zeros((vocab_size, vocab_size), dtype=np.float64)
+        np.add.at(counts, (tok[:-1], tok[1:]), 1.0)
+        counts += 0.01
+        probs = counts / counts.sum(axis=1, keepdims=True)
+        log_probs = np.log(probs).astype(np.float16)
+        ent = -(probs * np.log(probs)).sum(axis=1).astype(np.float32)
+        mn, mx = ent.min(), ent.max()
+        ent_norm = (ent - mn) / (mx - mn) if mx > mn else np.full_like(ent, 0.5)
+        self.log_probs = torch.tensor(log_probs, device=device)
+        self.ent_norm = torch.tensor(ent_norm, dtype=torch.float16, device=device)
+        self.loss_ema = 0.0
+        self.loss_count = 0
+
+    @torch.no_grad()
+    def batch_weight(self, x: torch.Tensor, y: torch.Tensor,
+                     batch_loss: float = 0.0, power: float = 0.10) -> float:
+        if self.log_probs is None or power <= 0:
+            return 1.0
+        surp = -self.log_probs[x.reshape(-1), y.reshape(-1)].float()
+        ent_w = self.ent_norm[x.reshape(-1)].float()
+        bigram_score = (surp * ent_w).mean().item()
+        if batch_loss > 0 and self.loss_count > 10:
+            combined = bigram_score * min(batch_loss / max(self.loss_ema, 1e-6), 2.0)
+        else:
+            combined = bigram_score
+        if batch_loss > 0:
+            self.loss_ema = (0.99 * self.loss_ema + 0.01 * batch_loss
+                             if self.loss_count > 0 else batch_loss)
+            self.loss_count += 1
+        return 1.0 + power * min(combined / 5.0, 1.0)
+
 
 # --- Transformer modules ---
 
@@ -2360,6 +2411,8 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     train_loader = DistributedTokenLoader(
         args.train_files, rank, world_size, device)
+    _markov = _GPUMarkov(args.train_files, args.vocab_size, device)
+    log0(f"markov_curriculum:power={args.raki_power} {'ready' if _markov.log_probs is not None else 'disabled (no shard found)'}")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -2455,13 +2508,16 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         if not CastedLinear._qat_enabled:
-            should_qat = (args.late_qat_threshold >
-                          0 and scale < args.late_qat_threshold)
-            should_qat = should_qat or (
-                args.qat_start_step > 0 and step >= args.qat_start_step)
+            # Raki v6 style: QAT in last late_qat_steps before training ends
+            effective_end = stop_after_step if stop_after_step is not None else args.iterations
+            should_qat = (args.late_qat_steps > 0 and step >= effective_end - args.late_qat_steps)
+            # Legacy fallbacks
+            should_qat = should_qat or (args.late_qat_threshold > 0 and scale < args.late_qat_threshold)
+            should_qat = should_qat or (args.qat_start_step > 0 and step >= args.qat_start_step)
             if should_qat:
                 CastedLinear._qat_enabled = True
-                log0(f"qat:enabled step:{step} scale:{scale:.4f}")
+                torch._dynamo.reset()  # force recompile so QAT path is active in compiled graph
+                log0(f"qat:enabled step:{step} scale:{scale:.4f} (last {args.late_qat_steps} steps)")
         # Activate depth recurrence at specified step
         if not base_model.recur_active and args.recur_layers and step >= args.recur_start_step:
             base_model.recur_active = True
@@ -2479,7 +2535,8 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            (loss * grad_scale).backward()
+            _cw = _markov.batch_weight(x, y, loss.item(), args.raki_power)
+            (loss * _cw * grad_scale).backward()
         train_loss /= grad_accum_steps
         frac = min(step / args.muon_momentum_warmup_steps,
                    1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
