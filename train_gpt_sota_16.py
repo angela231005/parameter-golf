@@ -2613,11 +2613,15 @@ def main() -> None:
             base_model.load_state_dict(ema_avg, strict=True)
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items()
-                 if "mtp_heads" not in k}
+                 if "mtp_heads" not in k and "jepa_pred" not in k}
     excluded_mtp = sum(int(t.numel())
                        for k, t in full_state_dict.items() if "mtp_heads" in k)
+    excluded_jepa = sum(int(t.numel())
+                        for k, t in full_state_dict.items() if "jepa_pred" in k)
     if excluded_mtp > 0:
         log0(f"export_excluding_mtp_params:{excluded_mtp}")
+    if excluded_jepa > 0:
+        log0(f"export_excluding_jepa_params:{excluded_jepa}")
     if master_process:
         torch.save(export_sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
