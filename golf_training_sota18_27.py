@@ -46,10 +46,18 @@ BRANCH     = "ml"                    # our new branch with ideas 18-27
 # Which idea to run (18–27). Set via env var IDEA_NUM or override here.
 IDEA_NUM   = int(os.environ.get("IDEA_NUM", "18"))
 
-# Compute resources
-NPROC      = int(os.environ.get("NPROC", "8"))          # GPUs per node
 SEED       = int(os.environ.get("SEED", "1337"))        # change per run: 42, 999
 TARGET_MB  = float(os.environ.get("TARGET_MB", "15.9")) # artifact size limit
+
+# ── AUTO-DETECT GPUs ──────────────────────────────────────────────────────────
+_gpu_count = torch.cuda.device_count()
+if _gpu_count == 0:
+    raise RuntimeError("No CUDA GPUs found! This script requires at least 1 GPU.")
+# Use all available GPUs unless NPROC is explicitly set
+NPROC = int(os.environ.get("NPROC", str(_gpu_count)))
+if NPROC > _gpu_count:
+    print(f"[WARNING] NPROC={NPROC} > available GPUs={_gpu_count}. Clamping to {_gpu_count}.")
+    NPROC = _gpu_count
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Data paths (Kaggle / custom env)
@@ -63,7 +71,7 @@ TOKENIZER_PATH  = os.environ.get(
 assert 18 <= IDEA_NUM <= 27, f"IDEA_NUM must be 18-27, got {IDEA_NUM}"
 
 SCRIPT = f"train_gpt_sota_{IDEA_NUM}.py"
-print(f"GPU count: {torch.cuda.device_count()}")
+print(f"GPU count detected: {_gpu_count}  →  using NPROC={NPROC}")
 print(f"Running: {SCRIPT}  |  SEED={SEED}  |  nproc={NPROC}  |  target={TARGET_MB}MB")
 
 # %% [markdown]
@@ -104,6 +112,13 @@ os.system('python3 -c "import sentencepiece, zstandard; print(\'deps OK\')"')
 
 # %%
 # Base hyperparameters (shared across all ideas)
+# TRAIN_BATCH_TOKENS scaled to GPU count: 786432 is baseline for 8 GPUs
+_BASE_BATCH_8GPU = 786432
+_SCALED_BATCH = max(65536, (_BASE_BATCH_8GPU // 8) * NPROC)  # scale linearly, min 64K
+_GRAD_ACCUM = max(1, 8 // NPROC)  # compensate with gradient accumulation when < 8 GPUs
+print(f"Batch scaling: {_BASE_BATCH_8GPU} (8GPU) → {_SCALED_BATCH} ({NPROC}GPU), "
+      f"grad_accum_steps={_GRAD_ACCUM}")
+
 BASE_ENV = {
     "SEED":               str(SEED),
     "DATA_PATH":          DATA_PATH,
@@ -113,7 +128,8 @@ BASE_ENV = {
     "WARMDOWN_ITERS":     "4000",
     "TRAIN_SEQ_LEN":      "2048",
     "EVAL_SEQ_LEN":       "2048",
-    "TRAIN_BATCH_TOKENS": "786432",
+    "TRAIN_BATCH_TOKENS": str(_SCALED_BATCH),
+    "GRAD_ACCUM_STEPS":   str(_GRAD_ACCUM),
     "NUM_LAYERS":         "11",
     "MODEL_DIM":          "512",
     "NUM_HEADS":          "8",
