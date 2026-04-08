@@ -12,7 +12,7 @@
 #
 # **Inherited from sota_22 (unchanged):**
 # - Mousse EMA optimizer (beta=0.95, PR #1440)
-# - TTT AdamW lr=0.01 (PR #1440: beats SGD)
+# - TTT SGD lr=0.002 (AdamW lr=0.01 DESTROYED sota_22: 1.1047→1.7984; never again)
 # - RECUR_COUNT=1 — Raki v6 actual code: 1 extra pass (log said 2 but code is 1); count=2 was 54% overhead
 # - LAWA (k=15, freq=50)
 # - GPTQ 11-candidate percentile grid + 128 AR calibration seqs
@@ -103,6 +103,11 @@ env = " ".join([
     f"NGRAM_BETA=0.5",
     # --- Eval-time hash embedding ---
     f"HASH_EMB_SIZE=32768",
+    # --- Markov curriculum (Raki v6: upweight bigram-hard tokens, power=0.10) ---
+    f"RAKI_POWER=0.10",
+    # --- Late QAT: only last 200 steps (Raki v6 style) ---
+    f"LATE_QAT_STEPS=200",
+    f"LATE_QAT_THRESHOLD=0",          # disable LR-threshold trigger; use step-count only
 ])
 
 cmd = f"{env} torchrun --standalone --nproc_per_node={NPROC} train_gpt_sota_23.py"
