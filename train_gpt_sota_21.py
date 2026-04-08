@@ -21,6 +21,14 @@ import copy
 import os
 os.environ.setdefault('TORCHINDUCTOR_COMBO_KERNELS',
                       '0')  # must be before torch import
+# Limit op fusion to prevent Triton SRAM OOM on fused rms_norm_backward kernels.
+# The default max_fusion_size=64 fuses too many ops (11 layers × rms_norm + MTP +
+# parallel residuals) into a single kernel that exceeds H100 SRAM (232 KB limit).
+try:
+    import torch._inductor.config as _inductor_cfg
+    _inductor_cfg.max_fusion_size = 16
+except Exception:
+    pass
 try:
     import brotli
     _HAS_BROTLI = True
