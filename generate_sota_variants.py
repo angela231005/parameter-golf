@@ -508,12 +508,63 @@ TITLES = {
     27: "Legal TTT + Hash Embed Adapt + N-gram Beta Decay",
 }
 
+def apply_bugfixes(src):
+    """Apply known bug fixes inherited from sota_17 to every variant.
+
+    Bug 1 — JEPA state_dict key mismatch (RuntimeError at eval):
+        eval_model is created with jepa_neck=0 (no jepa_pred module) but
+        deq_state still contains 'jepa_pred.*' keys → strict load fails.
+        Fix: filter out jepa_pred keys before load_state_dict.
+
+    Bug 2 — torch._dynamo FailOnRecompileLimitHit at eval time:
+        cache_size_limit=64 is already set once in sota_17 (line 2834)
+        but NOT before the first training compile or before the recur
+        recompile. Fix: inject it at both compile sites too.
+    """
+    # ── Bug 1: filter JEPA keys from deq_state before eval model load ─────────
+    old_load = "    eval_model.load_state_dict(deq_state, strict=True)"
+    new_load = (
+        "    # [BUGFIX] filter training-only keys (jepa_pred.*) absent in eval_model\n"
+        "    _eval_keys = set(eval_model.state_dict().keys())\n"
+        "    deq_state = {k: v for k, v in deq_state.items() if k in _eval_keys}\n"
+        "    eval_model.load_state_dict(deq_state, strict=True)"
+    )
+    if old_load in src:
+        src = src.replace(old_load, new_load)
+
+    # ── Bug 2: dynamo cache_size_limit before every torch.compile call ─────────
+    # First compile (training)
+    old_c1 = "    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)\n    model = compiled_model"
+    new_c1 = (
+        "    torch._dynamo.config.cache_size_limit = 64  # [BUGFIX] avoid FailOnRecompileLimitHit\n"
+        + old_c1
+    )
+    if old_c1 in src and "cache_size_limit" not in src.split(old_c1)[0].split("\n")[-2]:
+        src = src.replace(old_c1, new_c1, 1)
+
+    # Recompile when recurrence is activated mid-training
+    old_c2 = (
+        "            compiled_model = torch.compile(\n"
+        "                base_model, dynamic=False, fullgraph=True)\n"
+        "            model = compiled_model"
+    )
+    new_c2 = (
+        "            torch._dynamo.config.cache_size_limit = 64  # [BUGFIX] recur recompile\n"
+        + old_c2
+    )
+    if old_c2 in src:
+        src = src.replace(old_c2, new_c2, 1)
+
+    return src
+
+
 if __name__ == "__main__":
     success, failed = [], []
     for n, builder in sorted(BUILDERS.items()):
         out = Path(f"train_gpt_sota_{n}.py")
         try:
             patched = builder(SRC)
+            patched = apply_bugfixes(patched)
             ast.parse(patched)
             out.write_text(patched, encoding="utf-8")
             kb = len(patched) // 1024
@@ -525,3 +576,4 @@ if __name__ == "__main__":
     print(f"\nOK: {success}")
     print(f"FAIL: {failed}")
     sys.exit(0 if not failed else 1)
+

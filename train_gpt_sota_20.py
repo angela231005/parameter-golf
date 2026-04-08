@@ -2334,6 +2334,7 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
+    torch._dynamo.config.cache_size_limit = 64  # [BUGFIX] avoid FailOnRecompileLimitHit
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
 
@@ -2554,6 +2555,7 @@ def main() -> None:
         if not base_model.recur_active and args.recur_layers and step >= args.recur_start_step:
             base_model.recur_active = True
             # Need to recompile since forward graph changed
+            torch._dynamo.config.cache_size_limit = 64  # [BUGFIX] recur recompile
             compiled_model = torch.compile(
                 base_model, dynamic=False, fullgraph=True)
             model = compiled_model
@@ -2859,6 +2861,9 @@ def main() -> None:
         if isinstance(m, CastedLinear):
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
+    # [BUGFIX] filter training-only keys (jepa_pred.*) absent in eval_model
+    _eval_keys = set(eval_model.state_dict().keys())
+    deq_state = {k: v for k, v in deq_state.items() if k in _eval_keys}
     eval_model.load_state_dict(deq_state, strict=True)
     # avoid recompile_limit hit on fresh eval model
     torch._dynamo.config.cache_size_limit = 64
