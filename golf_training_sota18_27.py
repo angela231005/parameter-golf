@@ -13,71 +13,34 @@
 # ---
 
 # %% [markdown]
-# # Parameter Golf — SOTA_18–27 Training Runner
+# # Parameter Golf — SOTA_18–27 Training Runner (branch: ml)
+# 10 breakthrough ideas targeting BPB < 1.090 (current SOTA: 1.1147).
 #
-# Chạy 10 ý tưởng đột phá từ branch `ml`, mục tiêu BPB < 1.090.
-#
-# | # | Script | Ý tưởng | BPB dự kiến |
-# |---|--------|---------|-------------|
-# | 18 | sota_18 | AWQ + Hadamard Pre-Rotation GPTQ | -0.006~-0.012 |
-# | 19 | sota_19 | 4-gram + 5-gram Hash Embedding | -0.002~-0.004 |
-# | 20 | sota_20 | int5 Mixed-Precision GPTQ | -0.003~-0.007 |
-# | 21 | sota_21 | recur_passes=3 + Untied Adapters | -0.003~-0.005 |
-# | 22 | sota_22 | Cautious WD + Per-Layer LR Decay | -0.002~-0.003 |
-# | 23 | sota_23 | Differential Attention + XSA | -0.003~-0.006 |
-# | 24 | sota_24 | 3-Lane Parallel Residual | -0.002~-0.004 |
-# | 25 | sota_25 | Self-Distillation QAT | -0.004~-0.008 |
-# | 26 | sota_26 | Mini 2-Expert MoE MLP | -0.002~-0.005 |
-# | 27 | sota_27 | TTT + Hash Embed Adapt + N-gram Beta | -0.003~-0.005 |
+# | IDEA | Script | Key technique | Expected delta |
+# |------|--------|---------------|----------------|
+# | 18 | sota_18 | AWQ + Hadamard pre-rotation GPTQ | −0.006~−0.012 |
+# | 19 | sota_19 | 4-gram + 5-gram hash embedding | −0.002~−0.004 |
+# | 20 | sota_20 | int5 mixed-precision GPTQ | −0.003~−0.007 |
+# | 21 | sota_21 | recur_passes=3 + untied adapters | −0.003~−0.005 |
+# | 22 | sota_22 | Cautious WD + per-layer LR decay | −0.002~−0.003 |
+# | 23 | sota_23 | Differential Attention + XSA | −0.003~−0.006 |
+# | 24 | sota_24 | 3-lane parallel residual | −0.002~−0.004 |
+# | 25 | sota_25 | Self-distillation QAT (fp32 teacher) | −0.004~−0.008 |
+# | 26 | sota_26 | Mini 2-expert MoE MLP | −0.002~−0.005 |
+# | 27 | sota_27 | Legal TTT + hash embed adapt | −0.003~−0.005 |
 
 # %% [markdown]
-# ## 1. Setup — Clone repo (branch ml) + Install deps
+# ## 1. Clone repo (branch ml)
 
 # %%
-import os
-import sys
 import torch
+import glob
+import os
 
-# ── EDIT THESE ────────────────────────────────────────────────────────────────
-REPO_URL   = "https://github.com/angela231005/parameter-golf"
-REPO_DIR   = "parameter-golf"
-BRANCH     = "ml"                    # our new branch with ideas 18-27
+REPO_URL = "https://github.com/angela231005/parameter-golf"
+REPO_DIR = "parameter-golf"
+BRANCH   = "ml"
 
-# Which idea to run (18–27). Set via env var IDEA_NUM or override here.
-IDEA_NUM   = int(os.environ.get("IDEA_NUM", "18"))
-
-SEED       = int(os.environ.get("SEED", "1337"))        # change per run: 42, 999
-TARGET_MB  = float(os.environ.get("TARGET_MB", "15.9")) # artifact size limit
-
-# ── AUTO-DETECT GPUs ──────────────────────────────────────────────────────────
-_gpu_count = torch.cuda.device_count()
-if _gpu_count == 0:
-    raise RuntimeError("No CUDA GPUs found! This script requires at least 1 GPU.")
-# Use all available GPUs unless NPROC is explicitly set
-NPROC = int(os.environ.get("NPROC", str(_gpu_count)))
-if NPROC > _gpu_count:
-    print(f"[WARNING] NPROC={NPROC} > available GPUs={_gpu_count}. Clamping to {_gpu_count}.")
-    NPROC = _gpu_count
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Data paths (Kaggle / custom env)
-DATA_PATH       = os.environ.get(
-    "DATA_PATH",
-    "/kaggle/input/datasets/haphmph/parameter-golf/data/datasets/fineweb10B_sp1024")
-TOKENIZER_PATH  = os.environ.get(
-    "TOKENIZER_PATH",
-    "/kaggle/input/datasets/haphmph/parameter-golf/data/tokenizers/fineweb_1024_bpe.model")
-
-assert 18 <= IDEA_NUM <= 27, f"IDEA_NUM must be 18-27, got {IDEA_NUM}"
-
-SCRIPT = f"train_gpt_sota_{IDEA_NUM}.py"
-print(f"GPU count detected: {_gpu_count}  →  using NPROC={NPROC}")
-print(f"Running: {SCRIPT}  |  SEED={SEED}  |  nproc={NPROC}  |  target={TARGET_MB}MB")
-
-# %% [markdown]
-# ## 2. Clone / Update repo (branch ml)
-
-# %%
 if not os.path.exists(REPO_DIR):
     os.system(f"git clone -b {BRANCH} {REPO_URL} {REPO_DIR}")
 else:
@@ -88,233 +51,131 @@ else:
 os.chdir(REPO_DIR)
 print("cwd:", os.getcwd())
 
-# Verify the script exists
-if not os.path.exists(SCRIPT):
-    raise FileNotFoundError(
-        f"{SCRIPT} not found in {os.getcwd()}. "
-        f"Run generate_sota_variants.py on branch {BRANCH} first.")
-print(f"Script found: {SCRIPT}  ({os.path.getsize(SCRIPT)//1024} KB)")
-
 # %% [markdown]
-# ## 3. Install Dependencies
+# ## 2. Install dependencies
 
 # %%
 os.system("pip install -q sentencepiece zstandard brotli")
-os.system("pip install -q flash_attn_3 --find-links "
-          "https://windreamer.github.io/flash-attention3-wheels/cu128_torch291 || true")
-os.system('python3 -c "import sentencepiece, zstandard; print(\'deps OK\')"')
+os.system('python3 -c "import sentencepiece, zstandard, brotli; print(\'deps OK\')"')
 
 # %% [markdown]
-# ## 4. Per-Idea Hyperparameters
-#
-# Each cell block shows the recommended hyperparameters for that idea.
-# Only the block matching IDEA_NUM is used.
+# ## 3. Set hyperparameters
 
 # %%
-# Base hyperparameters (shared across all ideas)
-# TRAIN_BATCH_TOKENS scaled to GPU count: 786432 is baseline for 8 GPUs
-_BASE_BATCH_8GPU = 786432
-_SCALED_BATCH = max(65536, (_BASE_BATCH_8GPU // 8) * NPROC)  # scale linearly, min 64K
-_GRAD_ACCUM = max(1, 8 // NPROC)  # compensate with gradient accumulation when < 8 GPUs
-print(f"Batch scaling: {_BASE_BATCH_8GPU} (8GPU) → {_SCALED_BATCH} ({NPROC}GPU), "
-      f"grad_accum_steps={_GRAD_ACCUM}")
+# --- Tune these ---
+IDEA_NUM  = 18          # Which idea to run: 18–27
+SEED      = 1337        # change per run: 314, 42, 999
+NPROC     = torch.cuda.device_count()  # auto-detect; override manually if needed
+TARGET_MB = 15.9
 
-BASE_ENV = {
-    "SEED":               str(SEED),
-    "DATA_PATH":          DATA_PATH,
-    "TOKENIZER_PATH":     TOKENIZER_PATH,
-    "TARGET_MB":          str(TARGET_MB),
-    "ITERATIONS":         "6927",
-    "WARMDOWN_ITERS":     "4000",
-    "TRAIN_SEQ_LEN":      "2048",
-    "EVAL_SEQ_LEN":       "2048",
-    "TRAIN_BATCH_TOKENS": str(_SCALED_BATCH),
-    "GRAD_ACCUM_STEPS":   str(_GRAD_ACCUM),
-    "NUM_LAYERS":         "11",
-    "MODEL_DIM":          "512",
-    "NUM_HEADS":          "8",
-    "NUM_KV_HEADS":       "4",
-    "MLP_MULT":           "3.0",
-    "VOCAB_SIZE":         "1024",
-    "BIGRAM_VOCAB_SIZE":  "3072",
-    "BIGRAM_DIM":         "112",
-    "XSA_LAST_N":         "11",
-    "ROPE_DIMS":          "16",
-    "QK_GAIN_INIT":       "4.0",
-    "LN_SCALE":           "1",
-    "VE_ENABLED":         "1",
-    "VE_LAYERS":          "9,10",
-    "SWA_ENABLED":        "1",
-    "SWA_EVERY":          "50",
-    "NGPT":               "1",
-    "PARALLEL_RESIDUAL":  "1",
-    "PARALLEL_START_LAYER": "5",
-    "RECUR_LAYERS":       "2,3,4,5",
-    "MAX_WALLCLOCK_SECONDS": "0",
-    "TORCHINDUCTOR_COMBO_KERNELS": "0",
+# --- Paths ---
+DATA_PATH      = "/kaggle/input/datasets/haphmph/parameter-golf/data/datasets/fineweb10B_sp1024"
+TOKENIZER_PATH = "/kaggle/input/datasets/haphmph/parameter-golf/data/tokenizers/fineweb_1024_bpe.model"
+
+ITERATIONS = 6927
+
+# Batch scaling: 786432 is baseline for 8 GPUs; scale down for fewer GPUs
+# and compensate with gradient accumulation to keep effective batch size equal.
+_batch   = max(65536, 786432 // 8 * NPROC)
+_gacc    = max(1, 8 // NPROC)
+
+# --- Per-idea extra env vars ---
+IDEA_EXTRA = {
+    18: [  # AWQ + Hadamard GPTQ
+        "HADAMARD_ROTATION=1",
+        "AWQ_ALPHA=0.5",
+        "GPTQ_AR_SEQS=64",
+    ],
+    19: [  # 4-gram + 5-gram hash
+        "BIGRAM_VOCAB_SIZE=3072",
+        "TRIGRAM=1",
+    ],
+    20: [  # int5 mixed precision
+        "MIXED_PRECISION_QUANT=1",
+        "BOUNDARY_LAYERS_INT8=1",
+    ],
+    21: [  # recur_passes=3 + adapters
+        "RECUR_PASSES=3",
+        "RECUR_ADAPTER_DIM=64",
+        "RECUR_START_STEP=1000",
+        "RECUR_LAYERS=2,3,4,5",
+    ],
+    22: [  # Cautious WD + layerLR
+        "CAUTIOUS_WD=1",
+        "LAYER_LR_DECAY=0.92",
+        "MUON_WD=0.05",
+    ],
+    23: [  # Differential attention
+        "DIFF_ATTN=1",
+        "DIFF_ATTN_START_LAYER=4",
+    ],
+    24: [  # 3-lane parallel
+        "TRIPLE_LANE=1",
+        "TRIPLE_LANE_START=5",
+        "LOCAL_ATTN_WINDOW=128",
+    ],
+    25: [  # Self-distillation QAT
+        "DISTILL_ALPHA=0.3",
+        "DISTILL_TEMP=4.0",
+        "QAT_START_STEP=2000",
+    ],
+    26: [  # Mini MoE
+        "MOE_ENABLED=1",
+        "NUM_EXPERTS=2",
+    ],
+    27: [  # TTT + hash adapt
+        "TTT_ENABLED=1",
+        "TTT_HASH_ADAPT=1",
+        "NGRAM_BETA_DECAY=0.15",
+        "TTT_EPOCHS=5",
+        "TTT_LR=0.001",
+        "TTT_CHUNK_SIZE=16384",
+    ],
 }
 
-# Idea-specific overrides
-IDEA_OVERRIDES = {
-    18: {  # AWQ + Hadamard GPTQ
-        "HADAMARD_ROTATION": "1",
-        "AWQ_CALIBRATION":   "1",
-        "AWQ_ALPHA":         "0.5",
-        "GPTQ_AR_SEQS":      "64",
-    },
-    19: {  # 4-gram + 5-gram Hash
-        "BIGRAM_VOCAB_SIZE": "3072",
-        "TRIGRAM":           "1",
-        # fourgram/fivegram auto-enabled when vocab_size >= 2048
-    },
-    20: {  # int5 Mixed Precision
-        "MIXED_PRECISION_QUANT": "1",
-        "BOUNDARY_LAYERS_INT8":  "1",
-    },
-    21: {  # recur_passes=3 + adapters
-        "RECUR_PASSES":       "3",
-        "RECUR_ADAPTER_DIM":  "64",
-        "RECUR_START_STEP":   "1000",
-        "RECUR_LAYERS":       "2,3,4,5",
-    },
-    22: {  # Cautious WD + LayerLR
-        "CAUTIOUS_WD":    "1",
-        "LAYER_LR_DECAY": "0.92",
-        "MUON_WD":        "0.05",
-    },
-    23: {  # Differential Attention
-        "DIFF_ATTN":             "1",
-        "DIFF_ATTN_START_LAYER": "4",
-    },
-    24: {  # 3-Lane Parallel
-        "TRIPLE_LANE":         "1",
-        "TRIPLE_LANE_START":   "5",
-        "LOCAL_ATTN_WINDOW":   "128",
-    },
-    25: {  # Self-Distillation QAT
-        "DISTILL_ALPHA":   "0.3",
-        "DISTILL_TEMP":    "4.0",
-        "QAT_START_STEP":  "2000",
-    },
-    26: {  # Mini MoE
-        "MOE_ENABLED":  "1",
-        "NUM_EXPERTS":  "2",
-    },
-    27: {  # TTT + Hash Adapt
-        "TTT_ENABLED":      "1",
-        "TTT_HASH_ADAPT":   "1",
-        "NGRAM_BETA_DECAY": "0.15",
-        "TTT_EPOCHS":       "5",
-        "TTT_LR":           "0.001",
-        "TTT_CHUNK_SIZE":   "16384",
-    },
-}
+env = " ".join([
+    f"SEED={SEED}",
+    f"DATA_PATH={DATA_PATH}",
+    f"TOKENIZER_PATH={TOKENIZER_PATH}",
+    f"ITERATIONS={ITERATIONS}",
+    f"MAX_WALLCLOCK_SECONDS=0",
+    f"TARGET_MB={TARGET_MB}",
+    f"TRAIN_BATCH_TOKENS={_batch}",
+    f"GRAD_ACCUM_STEPS={_gacc}",
+    # --- Architecture (same as sota_17 baseline) ---
+    f"NUM_LAYERS=11",
+    f"MODEL_DIM=512",
+    f"NUM_HEADS=8",
+    f"NUM_KV_HEADS=4",
+    f"MLP_MULT=3.0",
+    f"VOCAB_SIZE=1024",
+    f"BIGRAM_VOCAB_SIZE=3072",
+    f"BIGRAM_DIM=112",
+    f"XSA_LAST_N=11",
+    f"ROPE_DIMS=16",
+    f"QK_GAIN_INIT=4.0",
+    f"LN_SCALE=1",
+    f"VE_ENABLED=1",
+    f"VE_LAYERS=9,10",
+    f"SWA_ENABLED=1",
+    f"SWA_EVERY=50",
+    f"NGPT=1",
+    f"PARALLEL_RESIDUAL=1",
+    f"PARALLEL_START_LAYER=5",
+    f"RECUR_LAYERS=2,3,4,5",
+    f"TORCHINDUCTOR_COMBO_KERNELS=0",
+    # --- Idea-specific ---
+    *IDEA_EXTRA.get(IDEA_NUM, []),
+])
 
-env_dict = {**BASE_ENV, **IDEA_OVERRIDES.get(IDEA_NUM, {})}
-env_str = " ".join(f"{k}={v}" for k, v in env_dict.items())
-print(f"\n[IDEA-{IDEA_NUM}] Environment variables:")
-for k, v in sorted(IDEA_OVERRIDES.get(IDEA_NUM, {}).items()):
-    print(f"  {k}={v}  (override)")
-
-# %% [markdown]
-# ## 5. Compose & Print Training Command
-
-# %%
-cmd = (
-    f"{env_str} "
-    f"torchrun --standalone --nproc_per_node={NPROC} {SCRIPT}"
-)
-print("\n" + "="*80)
-print("TRAINING COMMAND:")
-print("="*80)
+SCRIPT = f"train_gpt_sota_{IDEA_NUM}.py"
+cmd = f"{env} torchrun --standalone --nproc_per_node={NPROC} {SCRIPT}"
+print(f"IDEA={IDEA_NUM}  NPROC={NPROC}  batch={_batch}  grad_accum={_gacc}")
+print("Command:")
 print(cmd)
-print("="*80 + "\n")
 
 # %% [markdown]
-# ## 6. Run Training
-#
-# Uncomment the last line to actually execute, or copy the command above.
+# ## 4. Train!
 
 # %%
-# Safety: print first, user confirms
-print(f"Starting training for IDEA-{IDEA_NUM}: {SCRIPT}")
-print(f"SEED={SEED}, nproc={NPROC}, target={TARGET_MB}MB")
-
-# Run — set DRY_RUN=1 to skip execution
-if os.environ.get("DRY_RUN", "0") == "1":
-    print("[DRY_RUN] Skipping execution")
-else:
-    ret = os.system(cmd)
-    if ret != 0:
-        print(f"\n[WARNING] Training exited with code {ret}")
-    else:
-        print("\n[OK] Training completed successfully")
-
-# %% [markdown]
-# ## 7. Expected Output Files
-#
-# After training, the following files should appear in the repo directory:
-# - `final_model.int6.ptz` — compressed quantized model (~15.9MB)
-# - `final_model.pt` — full-precision model (large, for debugging)
-#
-# The key metric logged at the end:
-# ```
-# final_int6_sliding_window val_bpb: X.XXXX
-# ```
-# **Target: < 1.090 BPB**
-
-# %%
-# Check output file
-model_file = "final_model.int6.ptz"
-if os.path.exists(model_file):
-    size_mb = os.path.getsize(model_file) / 1024 / 1024
-    print(f"Model artifact: {model_file}  ({size_mb:.2f} MB)")
-    if size_mb > 16.0:
-        print("WARNING: artifact exceeds 16MB limit!")
-    elif size_mb > TARGET_MB:
-        print(f"WARNING: artifact ({size_mb:.2f}MB) exceeds TARGET_MB={TARGET_MB}")
-    else:
-        print(f"OK: artifact fits in {TARGET_MB}MB budget")
-else:
-    print(f"No output file yet: {model_file}")
-
-# %% [markdown]
-# ## 8. Quick Results Summary
-#
-# Tổng hợp kết quả sau mỗi seed run:
-
-# %%
-# Parse log for BPB results (run per seed separately)
-import glob
-import re
-
-log_pattern = "*.log"
-logs = sorted(glob.glob(log_pattern))
-if not logs:
-    print("No log files found yet")
-else:
-    print(f"Found {len(logs)} log file(s):")
-    bpbs = []
-    for log_f in logs:
-        content = open(log_f).read()
-        # Extract sliding window BPB
-        matches = re.findall(r"final_int6_sliding_window val_bpb:([\d.]+)", content)
-        if matches:
-            bpb = float(matches[-1])
-            bpbs.append(bpb)
-            print(f"  {log_f}: sliding_BPB = {bpb:.4f}")
-        else:
-            # Try non-sliding
-            matches2 = re.findall(r"val_bpb:([\d.]+)", content)
-            if matches2:
-                bpb = float(matches2[-1])
-                print(f"  {log_f}: BPB = {bpb:.4f} (non-sliding)")
-    if bpbs:
-        mean_bpb = sum(bpbs) / len(bpbs)
-        print(f"\nMean BPB ({len(bpbs)} seeds): {mean_bpb:.4f}")
-        if mean_bpb < 1.09:
-            print("TARGET ACHIEVED! BPB < 1.090")
-        elif mean_bpb < 1.1147:
-            print(f"SOTA BEATEN! (prev: 1.1147, ours: {mean_bpb:.4f})")
-        else:
-            print(f"Not yet beating SOTA (1.1147). Delta: {mean_bpb - 1.1147:+.4f}")
+os.system(cmd)
