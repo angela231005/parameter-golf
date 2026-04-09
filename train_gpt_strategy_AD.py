@@ -26,8 +26,7 @@ except ImportError:
         from flash_attn import flash_attn_func as flash_attn_3_func
     except ImportError:
         import warnings
-        warnings.warn("FlashAttention not found! Falling back to PyTorch SDPA (eager mode).")
-        @torch.compiler.disable
+        warnings.warn("FlashAttention not found! Falling back to PyTorch SDPA.")
         def flash_attn_3_func(q, k, v, causal=True):
             B, T_q, Hq, D = q.shape
             _, T_k, Hkv, _ = k.shape
