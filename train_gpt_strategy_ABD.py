@@ -28,9 +28,11 @@ except ImportError:
         import warnings
         warnings.warn("FlashAttention not found! Falling back to PyTorch SDPA.")
         def flash_attn_3_func(q, k, v, causal=True):
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
             out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-            return out.transpose(1, 2)
+            return out.transpose(1, 2).contiguous()
 
 try:
     import brotli
@@ -2049,10 +2051,10 @@ def main():
     torch.set_float32_matmul_precision("high")
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
+    enable_cudnn_sdp(True)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
     torch._dynamo.config.optimize_ddp = False
 
     h = Hyperparameters()
