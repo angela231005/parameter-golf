@@ -199,6 +199,14 @@ class Hyperparameters:
     seq_curriculum_shorter_lens: list = (
         [int(x) for x in _seq_curriculum_lens_str.split(",") if x.strip()]
     )
+    # --- SLOT: Score Test LOcally — frozen-model per-window delta (PR #1313, −0.25 BPB) ---
+    slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "0")))
+    slot_steps = int(os.environ.get("SLOT_STEPS", 24))
+    slot_lr = float(os.environ.get("SLOT_LR", 0.012))
+    slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.001))
+    slot_batch_seqs = int(os.environ.get("SLOT_BATCH_SEQS", 32))
+    # --- EMA decay (default 0.997; PR #1435 shows 0.9965 improves train-time score) ---
+    ema_decay_param = float(os.environ.get("EMA_DECAY", 0.997))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1546,6 +1554,23 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
+    def forward_hidden(self, input_ids: Tensor) -> Tensor:
+        """Return final normalized hidden states for SLOT evaluation (PR #1313)."""
+        x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
+        return self._run_backbone(x, input_ids)
+
+    def compute_logits(self, hidden: Tensor) -> Tensor:
+        """Compute logits from hidden states (used by SLOT scoring)."""
+        if self.tie_embeddings:
+            logits_proj = F.linear(hidden, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(hidden)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
 # --- Sliding window evaluation ---
 
 
@@ -1621,6 +1646,119 @@ def eval_val_sliding(
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
+    return val_loss, bits_per_token * tokens_per_byte
+
+
+def eval_val_slot(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """SLOT: Score Test LOcally (PR #1313, arXiv:2505.12392v2).
+
+    For each sliding window, creates throwaway per-window delta [bsz,1,d] and
+    logit_bias [bsz,1,vocab] and optimizes them with AdamW (24 steps, cosine LR)
+    on the scored positions. Model weights are FROZEN throughout; only delta and
+    logit_bias are trained then discarded after each window. No cross-window leakage.
+    """
+    stride = args.eval_stride if args.eval_stride > 0 else 64
+    seq_s = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    total_tok = val_tokens.numel() - 1
+    ws_list = [ws for ws in range(0, total_tok, stride)
+               if min(ws + seq_s, total_tok) - ws >= 1]
+    my_ws = ws_list[rank::world_size]
+    # Get projection weights (frozen, float32 for stable optimization)
+    if args.tie_embeddings:
+        proj_w = base_model.tok_emb.weight.detach().float()
+    else:
+        proj_w = base_model.lm_head.weight.detach().float()
+    softcap = base_model.logit_softcap
+    # Compile forward_hidden with fullgraph=False (allows Python control flow branches)
+    compiled_hidden = torch.compile(base_model.forward_hidden, dynamic=False, fullgraph=False)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_sum = torch.zeros((), device=device, dtype=torch.float64)
+    base_model.eval()
+    for bi in range(0, len(my_ws), args.slot_batch_seqs):
+        bws = my_ws[bi:bi + args.slot_batch_seqs]
+        bsz = len(bws)
+        xb_cpu = torch.zeros(bsz, seq_s, dtype=torch.int64)
+        yb_cpu = torch.zeros(bsz, seq_s, dtype=torch.int64)
+        wlens: list[int] = []
+        for i, ws in enumerate(bws):
+            wend = min(ws + seq_s, total_tok)
+            wlen = wend - ws
+            wlens.append(wlen)
+            xb_cpu[i, :wlen] = val_tokens[ws:wend]
+            yb_cpu[i, :wlen] = val_tokens[ws + 1:wend + 1]
+        xb = xb_cpu.to(device=device, non_blocking=True)
+        yb = yb_cpu.to(device=device, non_blocking=True)
+        # Compute frozen hidden states once per window batch
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            hidden = compiled_hidden(xb)
+        hidden_f = hidden.detach().float()
+        # Build scored-position mask (last stride tokens per non-first window)
+        mask = torch.zeros(bsz, seq_s, device=device)
+        for i, ws in enumerate(bws):
+            wlen = wlens[i]
+            s = 0 if ws == 0 else max(wlen - stride, 0)
+            mask[i, s:wlen] = 1.0
+        valid_count = mask.sum()
+        if valid_count == 0:
+            continue
+        # Per-window throwaway parameters
+        delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
+        logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
+        slot_opt = torch.optim.AdamW([delta, logit_bias], lr=args.slot_lr, weight_decay=1e-8, eps=1e-5)
+        targets_flat = yb.reshape(-1)
+        # Optimize delta + logit_bias for slot_steps steps with cosine LR
+        for step_i in range(args.slot_steps):
+            lr_t = args.slot_lr_min + 0.5 * (args.slot_lr - args.slot_lr_min) * (
+                1 + math.cos(math.pi * step_i / args.slot_steps))
+            for pg in slot_opt.param_groups:
+                pg['lr'] = lr_t
+            slot_opt.zero_grad()
+            h = hidden_f + delta
+            lp = F.linear(h, proj_w) + logit_bias
+            lg = softcap * torch.tanh(lp / softcap)
+            nll = F.cross_entropy(
+                lg.reshape(-1, lg.size(-1)), targets_flat, reduction="none"
+            ).reshape(bsz, seq_s)
+            slot_loss = (nll * mask).sum() / valid_count
+            slot_loss.backward()
+            slot_opt.step()
+        # Score the window with optimized (but detached) delta/logit_bias
+        with torch.no_grad():
+            h = hidden_f + delta.detach()
+            lp = F.linear(h, proj_w) + logit_bias.detach()
+            lg = softcap * torch.tanh(lp / softcap)
+            nll = F.cross_entropy(
+                lg.reshape(-1, lg.size(-1)), targets_flat, reduction="none"
+            ).reshape(bsz, seq_s)
+            for i, ws in enumerate(bws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                loss_sum += nll[i, s:wlen].sum().to(torch.float64)
+                token_count += float(wlen - s)
+                prev_ids = xb[i, s:wlen]
+                tgt_ids = yb[i, s:wlen]
+                tb = base_bytes_lut[tgt_ids].to(torch.float64)
+                tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+                byte_sum += tb.sum()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM)
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_sum.item()
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
 
@@ -2681,7 +2819,7 @@ def main() -> None:
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
     ema_state = {name: t.detach().float().clone()
                  for name, t in base_model.state_dict().items()}
-    ema_decay = 0.997
+    ema_decay = args.ema_decay_param
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -3139,6 +3277,22 @@ def main() -> None:
                 f"ttt:sliding_window val_loss:{ttt_sw_loss:.4f} val_bpb:{ttt_sw_bpb:.4f} "
                 f"stride:{args.eval_stride} eval_time:{1000*(time.perf_counter()-t_ttt_slide):.0f}ms")
             log0(f"ttt:sliding_window_exact val_loss:{ttt_sw_loss:.8f} val_bpb:{ttt_sw_bpb:.8f}")
+    # --- SLOT: frozen-model per-window delta (PR #1313, −0.25 BPB gain) ---
+    if args.slot_enabled:
+        torch._dynamo.reset()
+        torch.cuda.synchronize()
+        t_slot = time.perf_counter()
+        slot_val_loss, slot_val_bpb = eval_val_slot(
+            args, eval_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_slot val_loss:{slot_val_loss:.4f} val_bpb:{slot_val_bpb:.4f} "
+            f"steps:{args.slot_steps} lr:{args.slot_lr} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_slot):.0f}ms"
+        )
+        log0(f"final_slot_exact val_loss:{slot_val_loss:.8f} val_bpb:{slot_val_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 
