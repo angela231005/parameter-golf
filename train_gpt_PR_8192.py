@@ -19,7 +19,18 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+except ImportError:
+    try:
+        from flash_attn import flash_attn_func as flash_attn_3_func
+    except ImportError:
+        import warnings
+        warnings.warn("FlashAttention not found! Falling back to PyTorch SDPA.")
+        def flash_attn_3_func(q, k, v, causal=True):
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+            return out.transpose(1, 2)
 
 try:
     import brotli
