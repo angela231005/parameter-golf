@@ -31,6 +31,9 @@ except ImportError:
             q = q.transpose(1, 2).contiguous()
             k = k.transpose(1, 2).contiguous()
             v = v.transpose(1, 2).contiguous()
+            if q.shape[1] != k.shape[1]:
+                k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+                v = v.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
             out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
             return out.transpose(1, 2).contiguous()
 
