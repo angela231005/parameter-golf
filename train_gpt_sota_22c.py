@@ -4,8 +4,7 @@ import subprocess as _subprocess, sys as _sys
 # Safe to run if already installed (pip is idempotent for matching versions).
 _subprocess.run(
     [_sys.executable, "-m", "pip", "install", "-q",
-     "sentencepiece", "zstandard", "brotli",
-     "flash-attn", "--no-build-isolation"],
+     "sentencepiece", "zstandard", "brotli"],
     check=False,
 )
 import sentencepiece as spm

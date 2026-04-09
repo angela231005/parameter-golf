@@ -15,9 +15,10 @@
 # Old default 0.20 was too early; step-based trigger (QAT_START_STEP=4000) disabled.
 # With time-based training, step counts are unpredictable → threshold-only is safer.
 #
-# ### Change 3: flash-attn native GQA
-# train_gpt_sota_22c.py installs flash-attn at startup and falls back to SDPA.
-# Removes K/V repeat_interleave copy (4→8 heads) on every attention call.
+# ### Change 3: flash-attn native GQA (optional)
+# If flash-attn is pre-installed in the environment, train_gpt_sota_22c.py uses it
+# automatically (native GQA, no K/V repeat_interleave copy). Falls back to SDPA
+# if not available — Kaggle does not allow pip install flash-attn at runtime.
 #
 # ### Change 4: TTT_CHUNK_SIZE=65536 + GPTQ_AR_SEQS=128 (runtime)
 # Halved Python loop iterations during TTT eval, same total FLOPs.
@@ -48,7 +49,8 @@ print("cwd:", os.getcwd())
 
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # ## 2. Dependencies are auto-installed by train_gpt_sota_22c.py
-# (sentencepiece, zstandard, brotli, flash-attn — no manual step needed)
+# (sentencepiece, zstandard, brotli — no manual step needed)
+# flash-attn is used automatically if pre-installed; otherwise SDPA fallback.
 
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # ## 3. Set hyperparameters
