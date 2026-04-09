@@ -1,6 +1,6 @@
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Parameter Golf — SOTA_35 Training Run
-# **Early Loop Activation (35%) + TTT_EPOCHS=5 on sota_34 baseline.**
+# **Early Loop Activation (35%) + TTT_EPOCHS=5 + Runtime Optimizations.**
 #
 # ## What changed vs sota_34 (and why)
 #
@@ -14,7 +14,16 @@
 # More TTT adaptation rounds per 32K-token chunk.
 # PR #1437 (best clean SP8192) uses 3 epochs. PR #1489 (SP1024, illegal) uses 6 epochs.
 # 5 epochs is an unexplored middle ground — more adaptation without the time risk of 6.
-# Risk: evaluation may take longer. Fallback: revert to 3 if time budget exceeded.
+#
+# ### Change 3: TTT_CHUNK_SIZE 32768 → 65536 (runtime optimization)
+# Double chunk size → half as many chunks → half the Python loop overhead per TTT pass.
+# chunk_seqs = 65536 // 2048 = 32 seqs/chunk (was 16). batch_seqs stays capped at 8.
+# Total FLOPs unchanged, but 50% fewer optimizer.step() calls and Python iterations.
+# Adaptation frequency halved — compensated by 5 epochs (more thorough per-chunk learning).
+#
+# ### Change 4: GPTQ_AR_SEQS 256 → 128 (runtime optimization)
+# Halve GPTQ calibration time. PR #1394 (1.0856 BPB reference) uses just 32.
+# 128 is still 4× the default, giving good Hessian estimates without excessive cost.
 #
 # ## What did NOT change vs sota_34
 # All 4 core fixes from sota_34 are preserved:
@@ -116,12 +125,14 @@ env = " ".join([
     f"LAWA_K=15",
     f"LAWA_FREQ=50",
     # --- GPTQ calibration ---
-    f"GPTQ_AR_SEQS=256",
+    # 128 = 4× default (32). Halves calibration vs sota_34's 256. PR #1394 uses 32.
+    f"GPTQ_AR_SEQS=128",
     # --- Score-First TTT (all fixes from sota_34 preserved) ---
     f"TTT_ENABLED=1",
     f"TTT_OPTIMIZER=adamw",
     f"TTT_LR=0.005",
-    f"TTT_EPOCHS=5",          # Changed from 3 → 5 (more adaptation per chunk)
+    f"TTT_EPOCHS=5",          # 5 epochs × 32 seqs/chunk (65536 chunks)
+    f"TTT_CHUNK_SIZE=65536",  # 2× chunk → 50% fewer loop iterations, same total FLOPs
     f"TTT_FREEZE_BLOCKS=0",
     # --- Token-Only N-gram Tilt (PR #1437) ---
     f"NGRAM_BETA=0.5",
