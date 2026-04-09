@@ -59,10 +59,22 @@ def _decompress(data: bytes) -> bytes:
         return brotli.decompress(data)
 
 
-# flash_attn_3 replaced with PyTorch built-in SDPA for portability
+# flash_attn_3 replaced with PyTorch built-in SDPA for portability.
+# If flash_attn library (2.6+) is installed, use it: handles GQA natively (no K/V
+# repeat_interleave needed), registered as a torch.library op for fullgraph compile.
+try:
+    from flash_attn import flash_attn_func as _fa2_func
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
 
 
 def flash_attn_3_func(q, k, v, causal=True):
+    if _HAS_FLASH_ATTN:
+        # flash_attn layout: (B, T, H, D) — same as our input.
+        # GQA (num_heads_k != num_heads_q) handled natively; no K/V expansion needed.
+        return _fa2_func(q, k, v, causal=causal)
+    # Fallback: PyTorch built-in SDPA
     # flash_attn layout: (B, T, H, D) -> transpose to (B, H, T, D) for SDPA
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
