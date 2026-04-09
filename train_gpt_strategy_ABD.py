@@ -26,16 +26,23 @@ except ImportError:
         from flash_attn import flash_attn_func as flash_attn_3_func
     except ImportError:
         import warnings
-        warnings.warn("FlashAttention not found! Falling back to PyTorch SDPA.")
+        warnings.warn("FlashAttention not found! Falling back to PyTorch SDPA (eager mode).")
+        @torch.compiler.disable
         def flash_attn_3_func(q, k, v, causal=True):
-            q = q.transpose(1, 2).contiguous()
-            k = k.transpose(1, 2).contiguous()
-            v = v.transpose(1, 2).contiguous()
-            if q.shape[1] != k.shape[1]:
-                k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
-                v = v.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+            # Input format: (B, T, nheads, headdim) — same as flash_attn_interface
+            # SDPA expects: (B, nheads, T, headdim)
+            B, T_q, Hq, D = q.shape
+            _, T_k, Hkv, _ = k.shape
+            q = q.transpose(1, 2).contiguous()  # (B, Hq, T, D)
+            k = k.transpose(1, 2).contiguous()  # (B, Hkv, T, D)
+            v = v.transpose(1, 2).contiguous()  # (B, Hkv, T, D)
+            # Handle GQA: k/v may have fewer heads than q (Grouped Query Attention)
+            if Hkv != Hq:
+                groups = Hq // Hkv
+                k = k.unsqueeze(2).expand(B, Hkv, groups, T_k, D).reshape(B, Hq, T_k, D)
+                v = v.unsqueeze(2).expand(B, Hkv, groups, T_k, D).reshape(B, Hq, T_k, D)
             out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-            return out.transpose(1, 2).contiguous()
+            return out.transpose(1, 2).contiguous()  # back to (B, T, H, D)
 
 try:
     import brotli
