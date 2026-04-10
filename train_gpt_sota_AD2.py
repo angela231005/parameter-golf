@@ -141,6 +141,9 @@ class Hyperparameters():
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
     # [AD2] Number of times to repeat recur_layers (1 = original AD, 2 = 3 total passes)
     recur_count = int(os.environ.get("RECUR_COUNT", "2"))
+    # [AD2-5] Adaptive recurrence ramp: after recur_start_step, add 1 pass every recur_ramp_steps
+    # 0 = disable ramp (all passes activate at once)
+    recur_ramp_steps = int(os.environ.get("RECUR_RAMP_STEPS", "500"))
 
     # Parallel Residuals (Modification 5)
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
@@ -158,6 +161,11 @@ class Hyperparameters():
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adamw")
     ttt_beta1 = float(os.environ.get("TTT_BETA1", "0.9"))
     ttt_beta2 = float(os.environ.get("TTT_BETA2", "0.99"))
+    # [AD2-4] TTT LLRD: lower LR for deeper layers (0=bottom, num_layers-1=top)
+    # llrd=1.0 disables, llrd=0.9 means top layer gets full TTT_LR, bottom gets 0.9^(n-1)*TTT_LR
+    ttt_llrd = float(os.environ.get("TTT_LLRD", "0.85"))
+    # [AD2-4] TTT schedule per chunk: onecycle (default) or cosine
+    ttt_schedule = os.environ.get("TTT_SCHEDULE", "onecycle")
 
     # Pre-quant AdamW TTT (ported from #1423) — runs BEFORE GPTQ, baked into artifact
     # NOTE: DISABLED by default — uses val_tokens before eval, violates competition rules.
@@ -703,6 +711,7 @@ class GPT(nn.Module):
         self.recur_layers = [int(x) for x in h.recur_layers.split(",") if x.strip()]
         self.recur_count = h.recur_count  # [AD2] number of repeat passes
         self._recurrence_active = False
+        self._active_recur_count = 0  # [AD2-5] current effective pass count (ramped up)
 
         # Modification 5: Parallel Residuals
         self.parallel_start_layer = h.parallel_start_layer
@@ -718,21 +727,22 @@ class GPT(nn.Module):
 
     def _get_virtual_layers(self) -> list[int]:
         """Return virtual->physical block mapping.
-        When recurrence is active, recur_layers are repeated recur_count times.
-        e.g. num_layers=11, recur_layers=[4,5], recur_count=2:
+        When recurrence is active, recur_layers are repeated _active_recur_count times.
+        e.g. num_layers=11, recur_layers=[4,5], _active_recur_count=2:
             [0,1,2,3, 4,5, 4,5, 4,5, 6,7,8,9,10]  (3 total passes through 4,5)
-        When inactive: [0,1,2,...,num_layers-1]
+        When inactive or _active_recur_count==0: [0,1,2,...,num_layers-1]
         """
         n = len(self.blocks)
-        if not self._recurrence_active or not self.recur_layers:
+        count = self._active_recur_count if self._recurrence_active else 0
+        if count <= 0 or not self.recur_layers:
             return list(range(n))
         virtual = []
         inserted = False
         for i in range(n):
             virtual.append(i)
             if not inserted and i == self.recur_layers[-1]:
-                # [AD2] repeat recur_layers recur_count times (default=2 → 3 total passes)
-                for _ in range(self.recur_count):
+                # [AD2-5] repeat recur_layers _active_recur_count times
+                for _ in range(count):
                     for rl in self.recur_layers:
                         virtual.append(rl)
                 inserted = True
@@ -1683,10 +1693,33 @@ def eval_val_ttt(
     log_fn(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
            f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
-    optimizer = torch.optim.AdamW(ttt_params, lr=h.ttt_lr, weight_decay=0.0,
-                                      betas=(h.ttt_beta1, h.ttt_beta2), eps=1e-8) \
-        if h.ttt_optimizer == "adamw" else \
-        torch.optim.SGD(ttt_params, lr=h.ttt_lr, momentum=h.ttt_momentum)
+    # [AD2-4] Build per-layer-group optimizer with LLRD (layer-wise LR decay)
+    llrd = getattr(h, 'ttt_llrd', 1.0)
+    ttt_schedule = getattr(h, 'ttt_schedule', 'cosine')
+    num_blocks = len(base_model.blocks)
+    if h.ttt_optimizer == "adamw" and llrd < 1.0:
+        param_groups: list[dict] = []
+        for name, p in base_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            layer_scale = 1.0
+            if "blocks." in name:
+                try:
+                    layer_idx = int(name.split("blocks.")[1].split(".")[0])
+                    depth = num_blocks - 1 - layer_idx  # 0 = top (output-side), large = bottom
+                    layer_scale = llrd ** depth
+                except Exception:
+                    pass
+            elif "tok_emb" in name or "ve_" in name:
+                layer_scale = llrd ** num_blocks  # embeddings get smallest lr
+            param_groups.append({"params": [p], "lr": h.ttt_lr * layer_scale, "base_ttt_lr": h.ttt_lr * layer_scale, "weight_decay": 0.0})
+        optimizer = torch.optim.AdamW(param_groups, betas=(h.ttt_beta1, h.ttt_beta2), eps=1e-8)
+    elif h.ttt_optimizer == "adamw":
+        optimizer = torch.optim.AdamW(ttt_params, lr=h.ttt_lr, weight_decay=0.0,
+                                      betas=(h.ttt_beta1, h.ttt_beta2), eps=1e-8)
+    else:
+        optimizer = torch.optim.SGD(ttt_params, lr=h.ttt_lr, momentum=h.ttt_momentum)
+    log_fn(f"ttt_sliding:optimizer={h.ttt_optimizer} llrd={llrd} schedule={ttt_schedule}")
     batch_seqs = h.ttt_batch_seqs
     t0 = time.perf_counter()
 
@@ -1740,12 +1773,29 @@ def eval_val_ttt(
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
-                cos_lr = h.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in optimizer.param_groups:
-                    pg['lr'] = cos_lr
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
+                total_steps = h.ttt_epochs * max(1, (my_chunk_seqs + batch_seqs - 1) // batch_seqs)
+
+                # [AD2-4] Per-chunk LR schedule
+                if ttt_schedule == "onecycle" and h.ttt_optimizer == "adamw":
+                    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                        optimizer,
+                        max_lr=[pg.get('base_ttt_lr', pg['lr']) for pg in optimizer.param_groups],
+                        total_steps=max(total_steps, 1),
+                        pct_start=0.1,
+                        anneal_strategy='cos',
+                        div_factor=10.0,
+                        final_div_factor=1e4,
+                    )
+                else:
+                    # cosine LR across chunks (original behaviour)
+                    cos_scale = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = pg.get('base_ttt_lr', h.ttt_lr) * cos_scale
+                    scheduler = None
+
                 for _ep in range(h.ttt_epochs):
                     for bs in range(0, my_chunk_seqs, batch_seqs):
                         be = min(bs + batch_seqs, my_chunk_seqs)
@@ -1767,6 +1817,8 @@ def eval_val_ttt(
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                         torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
                         optimizer.step()
+                        if scheduler is not None:
+                            scheduler.step()
 
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
@@ -1925,10 +1977,19 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     while True:
         last_step = step == h.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        # Modification 2: activate recurrence at recur_start_step
-        if step == h.recur_start_step and not base_model._recurrence_active:
-            base_model.set_recurrence_active(True)
-            log(f"recurrence:activated at step {step}, virtual_layers={base_model._get_virtual_layers()}")
+        # [AD2-5] Adaptive recurrence ramp: add 1 pass every recur_ramp_steps after recur_start_step
+        if step >= h.recur_start_step:
+            if not base_model._recurrence_active:
+                base_model.set_recurrence_active(True)
+            steps_since = step - h.recur_start_step
+            if h.recur_ramp_steps > 0:
+                new_count = min(1 + steps_since // h.recur_ramp_steps, base_model.recur_count)
+            else:
+                new_count = base_model.recur_count
+            if new_count != base_model._active_recur_count:
+                base_model._active_recur_count = new_count
+                log(f"recurrence:ramp step={step} active_passes={new_count}/{base_model.recur_count} "
+                    f"virtual_layers={base_model._get_virtual_layers()}")
 
         should_validate = last_step or (h.val_loss_every > 0 and step % h.val_loss_every == 0)
         if should_validate:

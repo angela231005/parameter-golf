@@ -80,6 +80,7 @@ env = " ".join([
     f"MODEL_DIM=512",
     f"NUM_HEADS=8",
     f"NUM_KV_HEADS=4",
+    f"VOCAB_SIZE=1024",          # Kaggle dataset is sp1024
     f"QK_GAIN_INIT=5.0",
     f"SKIP_GATES_ENABLED=1",
     f"PARALLEL_START_LAYER=7",
@@ -94,22 +95,25 @@ env = " ".join([
 
     # --- [AD2-1] Multi-step Depth Recurrence ---
     # RECUR_COUNT=2 → 3 total passes through recur_layers
-    # Earlier activation than AD (2000 vs 3000) since model is more capable now
+    # [AD2-5] Ramp: activate 1 pass every RECUR_RAMP_STEPS after RECUR_START_STEP
     f"RECUR_LAYERS=3,4,5",
     f"RECUR_START_STEP=2000",
     f"RECUR_COUNT=2",
+    f"RECUR_RAMP_STEPS=500",     # 2000 → 1pass, 2500 → 2passes, 3000 → 3passes
 
     # --- [AD2-3] Dynamic EMA ---
     f"EMA_DECAY=0.9965",
     f"EMA_DECAY_EARLY=0.990",
     f"EMA_DECAY_LATE=0.9990",
 
-    # --- [AD2-2] TTT with AdamW ---
+    # --- [AD2-2] TTT with AdamW + LLRD + OneCycleLR ---
     f"TTT_ENABLED=1",
     f"TTT_OPTIMIZER=adamw",
     f"TTT_BETA1=0.9",
     f"TTT_BETA2=0.99",
     f"TTT_LR=0.005",
+    f"TTT_LLRD=0.85",            # layer-wise LR decay: top=TTT_LR, bottom=TTT_LR*0.85^depth
+    f"TTT_SCHEDULE=onecycle",    # warmup 10% then cosine anneal per chunk
     f"TTT_EPOCHS=5",
     f"TTT_CHUNK_TOKENS=32768",
     f"TTT_FREEZE_BLOCKS=0",
