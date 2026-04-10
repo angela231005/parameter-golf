@@ -89,9 +89,12 @@ env = " ".join([
     f"LAWA_K=15",
     f"LAWA_FREQ=50",
 
-    # --- Mousse optimizer ---
+    # --- Mousse optimizer OR MuonEq-R (mutually exclusive: Mousse cancels row-norm) ---
+    # Option A: Mousse ON, MuonEq-R naturally skipped (current default — sota_22c style)
     f"MOUSSE_ENABLED=1",
     f"MOUSSE_BETA=0.95",
+    # Option B: Mousse OFF, MuonEq-R active (strategy_AD style — uncomment to switch)
+    # f"MOUSSE_ENABLED=0",
 
     # --- GPTQ calibration ---
     f"GPTQ_AR_SEQS=128",

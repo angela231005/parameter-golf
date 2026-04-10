@@ -380,9 +380,10 @@ class Muon(torch.optim.Optimizer):
                     Linv = sp['L_ema'].clamp(min=eps_m).rsqrt().unsqueeze(1)   # [rows,1]
                     Rinv = sp['R_ema'].clamp(min=eps_m).rsqrt().unsqueeze(0)   # [1,cols]
                     update = (update.float() * Linv * Rinv).bfloat16()
-                # [22AD] Mod A: MuonEq-R — row-normalise gradient before NS5
-                # Forces unit-row-norm spectrum → more uniform update magnitudes.
-                if update.ndim == 2:
+                # [22AD] Mod A: MuonEq-R — row-normalise gradient before NS5.
+                # Only applied when Mousse is OFF: Mousse already scales per row/col,
+                # applying row-norm on top would cancel Mousse's curvature correction.
+                if update.ndim == 2 and not group.get("mousse", False):
                     row_norms = update.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
                     update = (update.float() / row_norms).to(update.dtype)
                 update = zeropower_via_newtonschulz5(
