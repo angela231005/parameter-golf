@@ -1767,26 +1767,25 @@ def eval_val_ttt(
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
-                # Strategy B: per-chunk LR scheduling with LLRD support
+                # Strategy B: global per-chunk LR scheduling with LLRD support
+                progress = ci / max(num_chunks - 1, 1)
                 if ttt_schedule == "onecycle":
-                    # OneCycleLR per chunk: warmup 10% then cosine anneal → 0
-                    chunk_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                        optimizer,
-                        max_lr=[pg["lr"] for pg in param_groups],
-                        total_steps=h.ttt_epochs,
-                        pct_start=0.1, anneal_strategy='cos',
-                        div_factor=10.0, final_div_factor=100.0,
-                    )
+                    # Global OneCycle-like shape over all chunks: 10% warmup, then cosine anneal
+                    if progress < 0.1:
+                        scale = progress / 0.1
+                    else:
+                        scale = 0.5 * (1.0 + math.cos(math.pi * (progress - 0.1) / 0.9))
+                    scale = max(scale, 0.01)
                 elif ttt_schedule == "cosine":
-                    # Global cosine decay across chunks (original behaviour, but with LLRD base)
-                    cos_scale = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                    for pg_orig, pg in zip(param_groups, optimizer.param_groups):
-                        pg['lr'] = pg_orig['lr'] * cos_scale
-                    chunk_scheduler = None
+                    scale = 0.5 * (1.0 + math.cos(math.pi * progress))
                 else:
-                    chunk_scheduler = None
-                # Reset Adam state per chunk so stale momentum doesn't carry over
-                optimizer.state.clear()
+                    scale = 1.0
+
+                for pg_orig, pg in zip(param_groups, optimizer.param_groups):
+                    pg['lr'] = pg_orig['lr'] * scale
+
+                # DO NOT clear optimizer state for AdamW! It needs to accumulate variance properly.
+
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
@@ -1811,9 +1810,7 @@ def eval_val_ttt(
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                         torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
                         optimizer.step()
-                    # Step per-chunk scheduler (OneCycleLR counts epochs)
-                    if chunk_scheduler is not None:
-                        chunk_scheduler.step()
+
 
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
