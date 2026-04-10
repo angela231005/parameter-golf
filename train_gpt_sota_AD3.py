@@ -13,8 +13,11 @@
 #           Cancels attention noise, sharpens focus on relevant tokens
 #
 # New in AD3:
-#   [AD3-fix] Forward pass now correctly unpacks (virtual_layers, pass_nums) from
-#             _get_virtual_layers() and wires per-pass adapter calls in encoder/decoder
+#   [AD3-fix1] Forward pass correctly unpacks (virtual_layers, pass_nums) from
+#              _get_virtual_layers() and wires per-pass adapter calls in encoder/decoder
+#   [AD3-fix2] Diff attention: replace 2 separate flash_attn calls with 1 call + split.
+#              Two separate calls triggered torch.compile InductorError (FusedMixOrderReductions).
+#              diff_lambda shape fixed to (h//2,). diff_proj (dim//2→dim) replaces zero-padding.
 # ============================================================
 import copy
 import glob
@@ -617,8 +620,13 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len)
         self.use_xsa = False
         # [AD2-7] Differential Attention
+        # Single flash_attn call on full q, then split output to avoid inductor
+        # FusedMixOrderReductions error that occurs with two separate attn calls.
+        # diff_proj maps dim//2 → dim (replaces zero-padding hack).
         self.use_diff_attn = False  # set by GPT.__init__ per layer
-        self.diff_lambda = nn.Parameter(torch.full((num_heads,), 0.8, dtype=torch.float32))
+        h2 = num_heads // 2
+        self.diff_lambda = nn.Parameter(torch.full((h2,), 0.8, dtype=torch.float32))
+        self.diff_proj = CastedLinear(h2 * self.head_dim, dim, bias=False)
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         B, T, H, D = y.shape
@@ -643,18 +651,21 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        # [AD2-7] Differential Attention: split heads in half, cancel noise
+        # [AD2-7] Differential Attention: single flash_attn call, split output
+        # One call avoids the torch.compile inductor FusedMixOrderReductions assert
+        # that fires when two separate attn reductions appear in the same backward graph.
         if self.use_diff_attn and self.num_heads >= 4:
             h2 = self.num_heads // 2
-            q1, q2 = q[:, :, :h2, :], q[:, :, h2:, :]
-            # Use same k,v for both halves (GQA-safe)
-            y1 = flash_attn_3_func(q1, k, v, causal=True)
-            y2 = flash_attn_3_func(q2, k, v, causal=True)
-            lam = torch.sigmoid(self.diff_lambda[:h2].to(q.dtype))[None, None, :, None]
-            y_diff = y1 - lam * y2
-            y = torch.cat([y_diff, torch.zeros_like(y_diff)], dim=2)
-        else:
-            y = flash_attn_3_func(q, k, v, causal=True)
+            # Single call with full q; split the result (mathematically equivalent
+            # to two calls with q1/q2 since k,v are shared across all head groups)
+            y_all = flash_attn_3_func(q, k, v, causal=True)
+            y1, y2 = y_all[:, :, :h2, :], y_all[:, :, h2:, :]
+            lam = torch.sigmoid(self.diff_lambda.to(q.dtype))[None, None, :, None]
+            y_diff = y1 - lam * y2  # (B, T, h2, head_dim)
+            # Project dim//2 → dim via diff_proj (cleaner than zero-padding)
+            y_flat = y_diff.reshape(bsz, seqlen, h2 * self.head_dim)
+            return self.diff_proj(y_flat)
+        y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
