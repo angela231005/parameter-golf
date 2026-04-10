@@ -1776,11 +1776,6 @@ def eval_val_ttt(
         ci = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
 
-    log_fn(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
-           f"total_windows={len(window_starts)} stride={stride} "
-           f"ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} "
-           f"freeze_blocks={h.ttt_freeze_blocks}")
-
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1798,9 +1793,6 @@ def eval_val_ttt(
         else:
             p.requires_grad_(True)
             ttt_params.append(p)
-
-    log_fn(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
-           f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
     # Strategy B: AdamW + Layer-wise LR Decay (LLRD) instead of flat SGD
     llrd = getattr(h, 'ttt_llrd', 1.0)
@@ -1822,8 +1814,20 @@ def eval_val_ttt(
             layer_scale = llrd ** num_blocks  # embeddings get smallest lr
         param_groups.append({"params": [p], "lr": h.ttt_lr * layer_scale, "weight_decay": 0.0})
     optimizer = torch.optim.AdamW(param_groups)
-    log_fn(f"ttt_sliding:optimizer=AdamW llrd={llrd} schedule={ttt_schedule}")
+
+    _n_unfrozen = sum(p.numel() for p in ttt_params)
+    _n_frozen = sum(p.numel() for p in base_model.parameters() if not p.requires_grad)
+    log_fn(
+        f"ttt:starting lr:{h.ttt_lr} epochs:{h.ttt_epochs} chunk_size:{ttt_chunk} "
+        f"freeze_blocks:{h.ttt_freeze_blocks} schedule:{ttt_schedule} llrd:{llrd} "
+        f"(Legal Score-First AdamW+LLRD)"
+    )
+    log_fn(
+        f"ttt:config chunks:{num_chunks} total_windows:{len(window_starts)} "
+        f"stride:{stride} params_unfrozen:{_n_unfrozen} params_frozen:{_n_frozen}"
+    )
     batch_seqs = h.ttt_batch_seqs
+    _report_interval = max(1, num_chunks // 10)
     t0 = time.perf_counter()
 
     for ci in range(num_chunks):
@@ -1931,12 +1935,17 @@ def eval_val_ttt(
                         optimizer.zero_grad(set_to_none=True)
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                             loss = base_model(x, y)
+                        # Guard: skip batch if loss is not finite (prevents BPB explosion)
+                        if not torch.isfinite(loss):
+                            log_fn(f"ttt:warn nonfinite_loss={loss.item():.4f} chunk={ci} ep={_ep}")
+                            continue
                         loss.backward()
                         if world_size > 1:
                             for p in ttt_params:
                                 if p.grad is not None:
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                         # NS-orthogonalized gradients for 2D params (Muon-style)
+                        # Uses LLRD-aware per-group lr (not global ttt_lr)
                         if h.ttt_ns_steps > 0:
                             with torch.no_grad():
                                 for p in ttt_params:
@@ -1944,35 +1953,66 @@ def eval_val_ttt(
                                         continue
                                     g = p.grad.detach().float()
                                     if g.ndim == 2:
-                                        effective_lr = scale * h.ttt_lr  # use scaled LR
+                                        # Look up this param's scaled lr from its param_group
+                                        pg_lr = next(
+                                            (pg['lr'] for pg in optimizer.param_groups
+                                             if any(pp is p for pp in pg['params'])),
+                                            scale * h.ttt_lr,
+                                        )
                                         g = zeropower_via_newtonschulz5(g, steps=h.ttt_ns_steps)
                                         g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                                        p.data.add_(g.to(p.dtype), alpha=-effective_lr)
+                                        p.data.add_(g.to(p.dtype), alpha=-pg_lr)
                                         p.grad = None  # already applied manually
-                        torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
+                        # Guard: skip optimizer step if gradients are not finite
+                        if not torch.isfinite(grad_norm):
+                            log_fn(f"ttt:warn nonfinite_grad norm={grad_norm.item():.4f} chunk={ci} ep={_ep}")
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
                         optimizer.step()
 
 
-        if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
+        if rank == 0 and (ci % _report_interval == _report_interval - 1 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
-            rl = loss_sum.item() / max(token_count.item(), 1)
-            rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log_fn(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            rate = (ci + 1) / max(elapsed, 1e-9)
+            log_fn(f"ttt:chunk {ci+1}/{num_chunks} elapsed:{elapsed:.0f}s chunks/s:{rate:.2f}")
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
 
-    val_loss = (loss_sum / token_count).item()
-    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    tc = token_count.item()
+    bc = byte_count.item()
+    if tc > 0 and bc > 0:
+        val_loss = (loss_sum / token_count).item()
+        val_bpb = val_loss / math.log(2.0) * (tc / bc)
+    else:
+        val_loss = float('nan')
+        val_bpb = float('nan')
 
+    ttt_elapsed_ms = 1000.0 * (time.perf_counter() - t0)
+    log_fn(f"ttt:score_first val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} ttt_time:{ttt_elapsed_ms:.0f}ms")
+    log_fn(f"ttt:score_first_exact val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}")
+
+    # Restore all params as trainable, put model in eval mode
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
 
-    log_fn(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
-           f"elapsed={time.perf_counter() - t0:.1f}s")
+    # Run sliding-window eval on the TTT-adapted model for final score
+    if h.sliding_window_enabled:
+        torch.cuda.synchronize()
+        sw_t0 = time.perf_counter()
+        sw_loss, sw_bpb = eval_val_sliding(h, device, val_data, base_model)
+        torch.cuda.synchronize()
+        sw_elapsed_ms = 1000.0 * (time.perf_counter() - sw_t0)
+        log_fn(
+            f"ttt:sliding_window val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} "
+            f"stride:{h.eval_stride} eval_time:{sw_elapsed_ms:.0f}ms"
+        )
+        log_fn(f"ttt:sliding_window_exact val_loss:{sw_loss:.8f} val_bpb:{sw_bpb:.8f}")
+
     return val_loss, val_bpb
 
 
@@ -1980,13 +2020,13 @@ def eval_val_ttt(
 # Eval orchestration
 # ----------------------------------------
 
-def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
+def timed_eval(label: str, fn, *args, extra_info: str = "", **kwargs) -> tuple[float, float]:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     val_loss, val_bpb = fn(*args, **kwargs)
     torch.cuda.synchronize()
     elapsed_ms = 1000.0 * (time.perf_counter() - t0)
-    log(f"{label} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} eval_time:{elapsed_ms:.0f}ms")
+    log(f"{label} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}{extra_info} eval_time:{elapsed_ms:.0f}ms")
     log(f"{label}_exact val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}")
     return val_loss, val_bpb
 
@@ -1995,24 +2035,33 @@ def run_evals(
     h: Hyperparameters,
     device: torch.device,
     val_data: ValidationData,
-    eval_model: torch.nn.Module
-):
+    eval_model: torch.nn.Module,
+    base_model: "GPT | None" = None,
+) -> None:
     # Save state dict BEFORE any inference_mode evals (for TTT later)
+    ttt_sd = None
     if h.ttt_enabled:
         ttt_sd = {k: v.detach().clone() for k, v in eval_model.state_dict().items()}
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
     timed_eval("final_int6_roundtrip", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
-        timed_eval("final_int6_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
-    if h.ttt_enabled:
-        # TTT needs fresh model with clean tensors (no inference_mode)
+        timed_eval(
+            "final_int6_sliding_window",
+            eval_val_sliding, h, device, val_data, eval_model,
+            extra_info=f" stride:{h.eval_stride}",
+        )
+    if h.ttt_enabled and ttt_sd is not None:
+        # TTT needs a fresh model with clean tensors (compiled/inference_mode tensors unusable)
         ttt_model = GPT(h).to(device).bfloat16()
         restore_fp32_params(ttt_model)
         ttt_model.load_state_dict(ttt_sd, strict=True)
-        if hasattr(ttt_model, 'set_recurrence_active'):
-            ttt_model.set_recurrence_active(True)
         del ttt_sd
-        timed_eval("final_int6_ttt", eval_val_ttt, h, ttt_model, device, val_data, log_fn=log)
+        if hasattr(ttt_model, 'set_recurrence_active'):
+            # Mirror the recurrence state of the trained model (not hardcoded True)
+            recur_active = base_model._recurrence_active if base_model is not None else True
+            ttt_model.set_recurrence_active(recur_active)
+        # eval_val_ttt handles its own logging: ttt:score_first + ttt:sliding_window
+        eval_val_ttt(h, ttt_model, device, val_data, log_fn=log)
 
 # -----------------------------
 # Training
@@ -2213,7 +2262,7 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     # Activate recurrence on eval model for consistent evaluation
     eval_model.set_recurrence_active(base_model._recurrence_active)
 
-    run_evals(h, device, val_data, eval_model)
+    run_evals(h, device, val_data, eval_model, base_model=base_model)
 
 
 def main():
