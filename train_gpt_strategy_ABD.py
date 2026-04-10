@@ -1845,7 +1845,8 @@ def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     val_loss, val_bpb = fn(*args, **kwargs)
     torch.cuda.synchronize()
     elapsed_ms = 1000.0 * (time.perf_counter() - t0)
-    log(f"{label} val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f} eval_time:{elapsed_ms:.0f}ms")
+    log(f"{label} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} eval_time:{elapsed_ms:.0f}ms")
+    log(f"{label}_exact val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}")
     return val_loss, val_bpb
 
 
