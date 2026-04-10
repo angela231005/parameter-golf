@@ -122,9 +122,9 @@ class Hyperparameters():
     # Parallel Residuals (Modification 5)
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
 
-    # TTT (Modification 4)
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    # Strategy A: Legal Score-First TTT (score each chunk BEFORE training on it = VALID)
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))            # SGD lr (no LLRD here — see ABD for AdamW+LLRD)
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
@@ -132,8 +132,8 @@ class Hyperparameters():
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
-    # Pre-quant AdamW TTT (ported from #1423) — runs BEFORE GPTQ, baked into artifact
-    prequant_ttt_enabled = bool(int(os.environ.get("PREQUANT_TTT_ENABLED", "1")))
+    # Pre-quant TTT — DISABLED by default (ILLEGAL: trains on full val before scoring)
+    prequant_ttt_enabled = bool(int(os.environ.get("PREQUANT_TTT_ENABLED", "0")))
     prequant_ttt_lr = float(os.environ.get("PREQUANT_TTT_LR", 0.0004))
     prequant_ttt_epochs = int(os.environ.get("PREQUANT_TTT_EPOCHS", 15))
     prequant_ttt_freeze_blocks = int(os.environ.get("PREQUANT_TTT_FREEZE_BLOCKS", 0))
