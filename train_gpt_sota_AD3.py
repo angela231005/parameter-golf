@@ -1984,7 +1984,8 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     restore_fp32_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     if h.distributed:
-        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
+        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False,
+                    find_unused_parameters=True)  # diff_attn uses diff_proj/proj selectively
     else:
         model = compiled_model
     log(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
