@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 import time
@@ -137,6 +138,27 @@ class Hyperparameters():
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ttt_llrd = float(os.environ.get("TTT_LLRD", 0.9))          # layer-wise LR decay factor
     ttt_schedule = os.environ.get("TTT_SCHEDULE", "onecycle")   # onecycle | cosine | constant
+
+    # Entropy-adaptive TTT epochs (from decode.py SOTA)
+    ttt_entropy_adaptive = bool(int(os.environ.get('TTT_ENTROPY_ADAPTIVE', '0')))
+    ttt_entropy_high = float(os.environ.get('TTT_ENTROPY_HIGH', 3.0))
+    ttt_entropy_low = float(os.environ.get('TTT_ENTROPY_LOW', 2.0))
+
+    # NS-orthogonalized TTT gradients (Muon-style, from decode.py SOTA)
+    ttt_ns_steps = int(os.environ.get('TTT_NS_STEPS', 0))  # 0=disabled, 3=recommended
+
+    # Hessian-aware SDClip (from decode.py SOTA)
+    hessian_clip_lambda = float(os.environ.get('HESSIAN_CLIP_LAMBDA', 0.0))  # 0=disabled, 0.3=recommended
+
+    # Per-group clip multipliers (from 3-seed Hessian analysis)
+    clip_mult_early = float(os.environ.get('CLIP_MULT_EARLY', 1.0))
+    clip_mult_loop = float(os.environ.get('CLIP_MULT_LOOP', 1.0))
+    clip_mult_mid = float(os.environ.get('CLIP_MULT_MID', 1.0))
+    clip_mult_late = float(os.environ.get('CLIP_MULT_LATE', 1.0))
+
+    # Loop-layer quantization (higher bits for looped layers)
+    loop_layer_bits = int(os.environ.get('LOOP_LAYER_BITS', 0))  # 0=use default int6
+    loop_layer_clip_sigmas = float(os.environ.get('LOOP_LAYER_CLIP_SIGMAS', 0.0))
 
     # Pre-quant TTT — DISABLED by default (ILLEGAL: trains on full val before scoring)
     prequant_ttt_enabled = bool(int(os.environ.get("PREQUANT_TTT_ENABLED", "0")))
@@ -1091,14 +1113,44 @@ def collect_hessians(
     return hessians
 
 
+def _is_recur_layer(name: str, h: Hyperparameters) -> bool:
+    """Check if a param name belongs to a recurrence layer."""
+    m = re.search(r'blocks\.(\d+)\.', name)
+    if m:
+        idx = int(m.group(1))
+        recur_layers = [int(x) for x in h.recur_layers.split(',') if x.strip()]
+        return idx in recur_layers
+    return False
+
+
+def _get_group_clip_mult(name: str, h: Hyperparameters) -> float:
+    """Get per-group clip multiplier for a weight matrix (from 3-seed Hessian analysis)."""
+    m = re.search(r'blocks\.(\d+)\.', name)
+    if not m:
+        return 1.0
+    idx = int(m.group(1))
+    recur_layers = [int(x) for x in h.recur_layers.split(',') if x.strip()]
+    if idx <= 2:
+        return h.clip_mult_early
+    if idx in recur_layers:
+        return h.clip_mult_loop
+    if idx in (3, 6, 7):
+        return h.clip_mult_mid
+    if idx >= 8:
+        return h.clip_mult_late
+    return 1.0
+
+
 def gptq_quantize_weight(
     w: Tensor,
     H: Tensor,
     clip_range: int = 31,
     block_size: int = 128,
     sdclip_k: float = 12.85,
+    hessian_clip_lambda: float = 0.0,
 ) -> tuple[Tensor, Tensor]:
-    """GPTQ with Cholesky error compensation and actorder (Frantar et al., ICLR 2023)."""
+    """GPTQ with Cholesky error compensation and actorder (Frantar et al., ICLR 2023).
+    Optionally applies Hessian-aware SDClip when hessian_clip_lambda > 0."""
     W_orig = w.float().clone()
     rows, cols = W_orig.shape
     H = H.float().clone()
@@ -1123,10 +1175,19 @@ def gptq_quantize_weight(
     except torch.linalg.LinAlgError:
         return quantize_int6_per_row(W_orig, clip_range)
 
-    # SDClip: c = k * std(row)
+    # SDClip: c = k * std(row), with optional Hessian-aware modulation
     row_std = W_orig.std(dim=1)
-    row_clip = (sdclip_k * row_std).clamp_min(1e-6)
-    s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+    if hessian_clip_lambda > 0.0:
+        # Hessian-aware SDClip: per-row modulation using GPTQ Hessian diagonal
+        diagH = torch.diag(H[invperm][:, invperm]).clamp_min(1e-8)
+        col_importance = diagH / diagH.mean()
+        row_importance = (W_orig.abs() * col_importance.unsqueeze(0)).mean(dim=1)
+        row_importance = row_importance / row_importance.mean()
+        adj = 1.0 + hessian_clip_lambda * (row_importance - 1.0)
+        s = (sdclip_k * row_std * adj / clip_range).clamp_min(1e-10).to(torch.float16)
+    else:
+        row_clip = (sdclip_k * row_std).clamp_min(1e-6)
+        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
     sf = s.float()
 
     Q = torch.zeros(rows, cols, dtype=torch.int8)
@@ -1155,10 +1216,12 @@ def gptq_mixed_quantize_int6(
     state_dict: dict[str, Tensor],
     int6_cats: set[str],
     hessians: dict[str, Tensor],
+    h: Hyperparameters,
     sdclip_k: float = 12.85,
     sdclip_k_embed: float = 20.0,
 ) -> tuple[dict[str, Tensor], dict[str, object]]:
-    """Mixed quantization using full GPTQ for layers with Hessians, fallback to clip-search."""
+    """Mixed quantization using full GPTQ for layers with Hessians, fallback to clip-search.
+    Enhanced with Hessian-aware SDClip, per-group clip multipliers, and loop-layer bits."""
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     gptq_count = 0
@@ -1178,19 +1241,36 @@ def gptq_mixed_quantize_int6(
             meta[name] = "passthrough_ctrl"
             continue
 
+        # Determine effective SDClip k with per-group multiplier
+        group_mult = _get_group_clip_mult(name, h)
+        effective_sdclip_k = sdclip_k * group_mult
+
+        # Determine bit-width (loop layers can use higher precision)
+        clip_range = 31  # default int6
+        bits_label = 6
+        if h.loop_layer_bits > 0 and _is_recur_layer(name, h) and t.ndim == 2:
+            clip_range = 2 ** (h.loop_layer_bits - 1) - 1
+            bits_label = h.loop_layer_bits
+            if h.loop_layer_clip_sigmas > 0:
+                effective_sdclip_k = h.loop_layer_clip_sigmas * group_mult
+            log(f"  loop_layer_quant: {name} -> int{bits_label} clip={effective_sdclip_k:.2f}")
+
         if cat in int6_cats and t.ndim == 2:
             if name in hessians:
-                q, s = gptq_quantize_weight(t, hessians[name], sdclip_k=sdclip_k)
+                q, s = gptq_quantize_weight(
+                    t, hessians[name], clip_range=clip_range,
+                    sdclip_k=effective_sdclip_k,
+                    hessian_clip_lambda=h.hessian_clip_lambda)
                 gptq_count += 1
-                meta[name] = {"type": "int6", "method": "gptq_sdclip"}
+                meta[name] = {"type": f"int{bits_label}", "method": "gptq_sdclip"}
             else:
-                q, s = quantize_int6_per_row(t, sdclip_k=sdclip_k)
+                q, s = quantize_int6_per_row(t, clip_range=clip_range, sdclip_k=effective_sdclip_k)
                 fallback_count += 1
-                meta[name] = {"type": "int6", "method": "sdclip"}
+                meta[name] = {"type": f"int{bits_label}", "method": "sdclip"}
             result[name + ".q"] = q
             result[name + ".scale"] = s
         elif cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t, sdclip_k=sdclip_k)
+            q, s = quantize_int6_per_row(t, sdclip_k=effective_sdclip_k)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
@@ -1201,6 +1281,11 @@ def gptq_mixed_quantize_int6(
             meta[name] = {"type": "int8_sdclip"}
 
     log(f"GPTQ quantization: {gptq_count} layers with full GPTQ, {fallback_count} fallback to clip-search")
+    if h.hessian_clip_lambda > 0:
+        log(f"  hessian_clip_lambda={h.hessian_clip_lambda}")
+    has_group_mults = any(getattr(h, f'clip_mult_{g}') != 1.0 for g in ('early', 'loop', 'mid', 'late'))
+    if has_group_mults:
+        log(f"  per_group_clip: early={h.clip_mult_early} loop={h.clip_mult_loop} mid={h.clip_mult_mid} late={h.clip_mult_late}")
     return result, meta
 
 
@@ -1429,7 +1514,31 @@ def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> int
             n_calibration_batches=h.gptq_calibration_batches,
         )
         log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter() - t0:.1f}s")
-        quant_result, quant_meta = gptq_mixed_quantize_int6(sd_cpu, {"mlp", "attn"}, hessians, sdclip_k=h.sdclip_k, sdclip_k_embed=h.sdclip_k_embed)
+
+        # Dump Hessian diagnostics for offline optimal clip analysis
+        if h.is_main_process and h.hessian_clip_lambda > 0:
+            diag_path = os.path.join(os.path.dirname(h.model_path) or '.', "hessian_diagnostics.pt")
+            diagnostics = {}
+            for diag_name, H_mat in hessians.items():
+                H_f = H_mat.float()
+                diagH = H_f.diag().clamp_min(1e-8)
+                col_imp = diagH / diagH.mean()
+                w = sd_cpu[diag_name].float()
+                row_imp = (w.abs() * col_imp.unsqueeze(0)).mean(dim=1)
+                row_imp = row_imp / row_imp.mean()
+                row_std = w.std(dim=1)
+                diagnostics[diag_name] = {
+                    "hessian_diag": diagH.cpu(),
+                    "col_importance": col_imp.cpu(),
+                    "row_importance": row_imp.cpu(),
+                    "row_std": row_std.cpu(),
+                    "hessian_trace": H_f.trace().item(),
+                    "shape": list(w.shape),
+                }
+            torch.save(diagnostics, diag_path)
+            log(f"GPTQ:saved Hessian diagnostics to {diag_path} ({len(diagnostics)} matrices)")
+
+        quant_result, quant_meta = gptq_mixed_quantize_int6(sd_cpu, {"mlp", "attn"}, hessians, h, sdclip_k=h.sdclip_k, sdclip_k_embed=h.sdclip_k_embed)
     else:
         quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
 
@@ -1730,6 +1839,8 @@ def eval_val_ttt(
         my_windows = windows[my_s:my_e]
 
         base_model.eval()
+        chunk_entropy = 0.0
+        chunk_count = 0
         with torch.no_grad():
             for bi in range(0, len(my_windows), batch_seqs):
                 batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1760,10 +1871,27 @@ def eval_val_ttt(
                     tb = val_data.base_bytes_lut[tgt].to(torch.float64)
                     tb += (val_data.has_leading_space_lut[tgt] & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
+                    # Track chunk entropy for adaptive epochs
+                    if h.ttt_entropy_adaptive:
+                        chunk_entropy += nll[i, :wlen].sum().item()
+                        chunk_count += wlen
 
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
-        if not is_last_chunk and h.ttt_epochs > 0:
+
+        # Determine epochs (entropy-adaptive or fixed)
+        if h.ttt_entropy_adaptive and chunk_count > 0:
+            chunk_nll_avg = chunk_entropy / chunk_count
+            if chunk_nll_avg > h.ttt_entropy_high:
+                epochs = h.ttt_epochs + 1
+            elif chunk_nll_avg < h.ttt_entropy_low:
+                epochs = max(h.ttt_epochs - 1, 1)
+            else:
+                epochs = h.ttt_epochs
+        else:
+            epochs = h.ttt_epochs
+
+        if not is_last_chunk and epochs > 0:
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
@@ -1789,7 +1917,7 @@ def eval_val_ttt(
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
-                for _ep in range(h.ttt_epochs):
+                for _ep in range(epochs):
                     for bs in range(0, my_chunk_seqs, batch_seqs):
                         be = min(bs + batch_seqs, my_chunk_seqs)
                         actual_bs = my_seq_s + bs
@@ -1808,6 +1936,19 @@ def eval_val_ttt(
                             for p in ttt_params:
                                 if p.grad is not None:
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        # NS-orthogonalized gradients for 2D params (Muon-style)
+                        if h.ttt_ns_steps > 0:
+                            with torch.no_grad():
+                                for p in ttt_params:
+                                    if p.grad is None:
+                                        continue
+                                    g = p.grad.detach().float()
+                                    if g.ndim == 2:
+                                        effective_lr = scale * h.ttt_lr  # use scaled LR
+                                        g = zeropower_via_newtonschulz5(g, steps=h.ttt_ns_steps)
+                                        g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                                        p.data.add_(g.to(p.dtype), alpha=-effective_lr)
+                                        p.grad = None  # already applied manually
                         torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
                         optimizer.step()
 
