@@ -125,18 +125,21 @@ class Hyperparameters():
     # Parallel Residuals (Modification 5)
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
 
-    # TTT (Modification 4)
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    # Strategy ABD: Legal Score-First TTT with AdamW + LLRD + OneCyclelR
+    # ttt_enabled=True by default — LEGAL: score each chunk BEFORE training on it
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.0004))          # AdamW lr (was 0.002 SGD)
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
-    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))  # kept for compat
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_llrd = float(os.environ.get("TTT_LLRD", 0.9))          # layer-wise LR decay factor
+    ttt_schedule = os.environ.get("TTT_SCHEDULE", "onecycle")   # onecycle | cosine | constant
 
-    # Pre-quant AdamW TTT (ported from #1423) — runs BEFORE GPTQ, baked into artifact
-    prequant_ttt_enabled = bool(int(os.environ.get("PREQUANT_TTT_ENABLED", "1")))
+    # Pre-quant TTT — DISABLED by default (ILLEGAL: trains on full val before scoring)
+    prequant_ttt_enabled = bool(int(os.environ.get("PREQUANT_TTT_ENABLED", "0")))
     prequant_ttt_lr = float(os.environ.get("PREQUANT_TTT_LR", 0.0004))
     prequant_ttt_epochs = int(os.environ.get("PREQUANT_TTT_EPOCHS", 15))
     prequant_ttt_freeze_blocks = int(os.environ.get("PREQUANT_TTT_FREEZE_BLOCKS", 0))
@@ -1690,7 +1693,27 @@ def eval_val_ttt(
     log_fn(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
            f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
-    optimizer = torch.optim.SGD(ttt_params, lr=h.ttt_lr, momentum=h.ttt_momentum)
+    # Strategy B: AdamW + Layer-wise LR Decay (LLRD) instead of flat SGD
+    llrd = getattr(h, 'ttt_llrd', 1.0)
+    ttt_schedule = getattr(h, 'ttt_schedule', 'cosine')
+    num_blocks = len(base_model.blocks)
+    param_groups = []
+    for name, p in base_model.named_parameters():
+        if not p.requires_grad:
+            continue
+        layer_scale = 1.0
+        if llrd < 1.0 and "blocks." in name:
+            try:
+                layer_idx = int(name.split("blocks.")[1].split(".")[0])
+                depth = num_blocks - 1 - layer_idx  # 0 = top layer (closest to output)
+                layer_scale = llrd ** depth
+            except Exception:
+                pass
+        elif llrd < 1.0 and ("tok_emb" in name or "ve_" in name):
+            layer_scale = llrd ** num_blocks  # embeddings get smallest lr
+        param_groups.append({"params": [p], "lr": h.ttt_lr * layer_scale, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(param_groups)
+    log_fn(f"ttt_sliding:optimizer=AdamW llrd={llrd} schedule={ttt_schedule}")
     batch_seqs = h.ttt_batch_seqs
     t0 = time.perf_counter()
 
@@ -1744,9 +1767,26 @@ def eval_val_ttt(
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
-                cos_lr = h.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in optimizer.param_groups:
-                    pg['lr'] = cos_lr
+                # Strategy B: per-chunk LR scheduling with LLRD support
+                if ttt_schedule == "onecycle":
+                    # OneCycleLR per chunk: warmup 10% then cosine anneal → 0
+                    chunk_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                        optimizer,
+                        max_lr=[pg["lr"] for pg in param_groups],
+                        total_steps=h.ttt_epochs,
+                        pct_start=0.1, anneal_strategy='cos',
+                        div_factor=10.0, final_div_factor=100.0,
+                    )
+                elif ttt_schedule == "cosine":
+                    # Global cosine decay across chunks (original behaviour, but with LLRD base)
+                    cos_scale = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                    for pg_orig, pg in zip(param_groups, optimizer.param_groups):
+                        pg['lr'] = pg_orig['lr'] * cos_scale
+                    chunk_scheduler = None
+                else:
+                    chunk_scheduler = None
+                # Reset Adam state per chunk so stale momentum doesn't carry over
+                optimizer.state.clear()
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
@@ -1771,6 +1811,9 @@ def eval_val_ttt(
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                         torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
                         optimizer.step()
+                    # Step per-chunk scheduler (OneCycleLR counts epochs)
+                    if chunk_scheduler is not None:
+                        chunk_scheduler.step()
 
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
