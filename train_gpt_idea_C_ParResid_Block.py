@@ -709,13 +709,6 @@ class GPT(nn.Module):
         self.recur_layers = [int(x) for x in h.recur_layers.split(",") if x.strip()]
         self._recurrence_active = False
 
-        # Modification 5: Parallel Residuals
-        self.parallel_start_layer = h.parallel_start_layer
-        if self.parallel_start_layer > 0 and self.parallel_start_layer < h.num_layers:
-            self.lane_merge = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
-        else:
-            self.lane_merge = None
-
         self._init_weights()
 
     def set_recurrence_active(self, active: bool) -> None:
@@ -919,8 +912,6 @@ class Optimizers():
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
-        if base_model.lane_merge is not None:
-            scalar_params.append(base_model.lane_merge)
 
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -987,7 +978,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,ve_layer_scales,ve_shared.scale,lane_merge",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,ve_layer_scales,ve_shared.scale",
     ).split(",")
     if pattern
 )
