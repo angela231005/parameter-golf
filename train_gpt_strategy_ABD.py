@@ -126,10 +126,10 @@ class Hyperparameters():
     # Parallel Residuals (Modification 5)
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
 
-    # Strategy ABD: Legal Score-First TTT with AdamW + LLRD + OneCyclelR
+    # Strategy ABD: Legal Score-First TTT (Imitating SOTA: SGD + LLRD + Local Cosine + Randperm)
     # ttt_enabled=True by default — LEGAL: score each chunk BEFORE training on it
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.0004))          # AdamW lr (was 0.002 SGD)
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))           # SOTA SGD lr
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
@@ -1813,14 +1813,16 @@ def eval_val_ttt(
         elif llrd < 1.0 and ("tok_emb" in name or "ve_" in name):
             layer_scale = llrd ** num_blocks  # embeddings get smallest lr
         param_groups.append({"params": [p], "lr": h.ttt_lr * layer_scale, "weight_decay": 0.0})
-    optimizer = torch.optim.AdamW(param_groups)
+    
+    # SOTA uses SGD with momentum for TTT. LLRD remains compatible.
+    optimizer = torch.optim.SGD(param_groups, momentum=getattr(h, "ttt_momentum", 0.9))
 
     _n_unfrozen = sum(p.numel() for p in ttt_params)
     _n_frozen = sum(p.numel() for p in base_model.parameters() if not p.requires_grad)
     log_fn(
         f"ttt:starting lr:{h.ttt_lr} epochs:{h.ttt_epochs} chunk_size:{ttt_chunk} "
         f"freeze_blocks:{h.ttt_freeze_blocks} schedule:{ttt_schedule} llrd:{llrd} "
-        f"(Legal Score-First AdamW+LLRD)"
+        f"(Legal Score-First SOTA-Imitation SGD+LLRD)"
     )
     log_fn(
         f"ttt:config chunks:{num_chunks} total_windows:{len(window_starts)} "
@@ -1899,42 +1901,54 @@ def eval_val_ttt(
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
-                # Strategy B: global per-chunk LR scheduling with LLRD support
-                progress = ci / max(num_chunks - 1, 1)
-                if ttt_schedule == "onecycle":
-                    # Global OneCycle-like shape over all chunks: 10% warmup, then cosine anneal
-                    if progress < 0.1:
-                        scale = progress / 0.1
-                    else:
-                        scale = 0.5 * (1.0 + math.cos(math.pi * (progress - 0.1) / 0.9))
-                    scale = max(scale, 0.01)
-                elif ttt_schedule == "cosine":
-                    scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-                else:
-                    scale = 1.0
-
-                for pg_orig, pg in zip(param_groups, optimizer.param_groups):
-                    pg['lr'] = pg_orig['lr'] * scale
-
-                # DO NOT clear optimizer state for AdamW! It needs to accumulate variance properly.
-
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
-                for _ep in range(epochs):
-                    for bs in range(0, my_chunk_seqs, batch_seqs):
-                        be = min(bs + batch_seqs, my_chunk_seqs)
-                        actual_bs = my_seq_s + bs
-                        start_tok = chunk_start + actual_bs * seq_len
-                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                        if end_tok > val_data.val_tokens.numel():
-                            continue
-                        local = val_data.val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
-                        x = local[:-1].reshape(-1, seq_len)
-                        y = local[1:].reshape(-1, seq_len)
-                        optimizer.zero_grad(set_to_none=True)
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss = base_model(x, y)
+                
+                my_start_tok = chunk_start + my_seq_s * seq_len
+                my_end_tok = chunk_start + my_seq_e * seq_len
+                
+                # Fetch sequences just like SOTA (contiguous block)
+                if my_end_tok + 1 > val_data.val_tokens.numel():
+                    available_seqs = (val_data.val_tokens.numel() - 1 - my_start_tok) // seq_len
+                    my_chunk_seqs = max(0, available_seqs)
+                    my_end_tok = my_start_tok + my_chunk_seqs * seq_len
+
+                if my_chunk_seqs > 0:
+                    xs = val_data.val_tokens[my_start_tok:my_end_tok].reshape(my_chunk_seqs, seq_len).to(device=device, dtype=torch.int64)
+                    ys = val_data.val_tokens[my_start_tok + 1:my_end_tok + 1].reshape(my_chunk_seqs, seq_len).to(device=device, dtype=torch.int64)
+
+                    num_batches = math.ceil(my_chunk_seqs / batch_seqs)
+                    total_steps = epochs * num_batches
+                    step_idx = 0
+
+                    for _ep in range(epochs):
+                        perm = torch.randperm(my_chunk_seqs, device=device)
+                        for bs in range(0, my_chunk_seqs, batch_seqs):
+                            # SOTA: Local decay within the chunk
+                            progress = step_idx / max(1, total_steps)
+                            if ttt_schedule == "onecycle":
+                                if progress < 0.1:
+                                    scale = progress / 0.1
+                                else:
+                                    scale = 0.5 * (1.0 + math.cos(math.pi * (progress - 0.1) / 0.9))
+                                scale = max(scale, 0.01)
+                            elif ttt_schedule == "cosine":
+                                scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+                            else:
+                                scale = 1.0
+
+                            for pg_orig, pg in zip(param_groups, optimizer.param_groups):
+                                pg['lr'] = pg_orig['lr'] * scale
+                            step_idx += 1
+
+                            idx = perm[bs:bs + batch_seqs]
+                            x = xs[idx]
+                            y = ys[idx]
+
+                            optimizer.zero_grad(set_to_none=True)
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                loss = base_model(x, y)
                         # Guard: skip batch if loss is not finite (prevents BPB explosion)
                         if not torch.isfinite(loss):
                             log_fn(f"ttt:warn nonfinite_loss={loss.item():.4f} chunk={ci} ep={_ep}")
