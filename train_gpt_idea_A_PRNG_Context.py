@@ -1778,8 +1778,7 @@ def eval_val_ttt(
 
     if log_fn is None:
         log_fn = lambda msg: None
-
-if getattr(h, 'context_memory_enabled', False):
+    if getattr(h, 'context_memory_enabled', False):
         base_model.context_memory_active = True
         base_model.context_values = torch.nn.Parameter(torch.zeros(base_model.model_dim, h.context_memory_dim, device=device, dtype=torch.float32))
 
@@ -1826,7 +1825,7 @@ if getattr(h, 'context_memory_enabled', False):
         ys = val_data.val_tokens[cs + 1:cs + nseq * seq_len + 1].reshape(nseq, seq_len).to(device=device, dtype=torch.int64)
 
         base_model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             for bi in range(0, nseq, batch_seqs):
                 bx = xs[bi:bi + batch_seqs]
                 by = ys[bi:bi + batch_seqs]

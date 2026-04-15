@@ -1767,7 +1767,7 @@ def eval_val_ttt(
         ys = val_data.val_tokens[cs + 1:cs + nseq * seq_len + 1].reshape(nseq, seq_len).to(device=device, dtype=torch.int64)
 
         base_model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             for bi in range(0, nseq, batch_seqs):
                 bx = xs[bi:bi + batch_seqs]
                 by = ys[bi:bi + batch_seqs]
